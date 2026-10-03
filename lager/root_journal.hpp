@@ -756,9 +756,12 @@ private:
         auto* table = root_table();
         std::uint64_t found_magic = 0;
         std::memcpy(&found_magic, &table->magic, sizeof(found_magic));
-        if (found_magic != root_table_magic) {
+        if (found_magic == 0) {
             table = ::new (table) shared_root_table{};
             table->magic = root_table_magic;
+        } else if (found_magic != root_table_magic) {
+            throw std::runtime_error{
+                "persistent root pin table version is incompatible"};
         }
         if (!table->global_generation.is_lock_free() ||
             !table->publication_state.is_lock_free() ||

@@ -104,6 +104,9 @@ being published and validates the same active sequence before accepting its
 descriptor. The pin-registration crash test covers process death between PID
 claim and descriptor publication for persistent pins. Both tables identify
 owners by PID alone, so PID reuse can make a dead pin appear live.
+The persistent root-table control-page magic was advanced for the sequence
+format; an unknown nonzero table version is rejected rather than reinitialized
+so opening a store cannot silently erase another process's live pins.
 
 * A reader claims a slot before loading the root, writes its descriptor, then
   publishes `ACTIVE` with release ordering and validates the root sequence.
