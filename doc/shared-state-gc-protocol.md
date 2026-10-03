@@ -131,8 +131,9 @@ rejected instead of reinitialized. No on-disk migration is implemented yet.
   persistent publication's durable marker selects either the old root or the
   complete new root after recovery.
 * If a process dies in `CLAIMING`, `ACTIVE`, or `RELEASING`, a reaper first
-  proves that the exact process instance is dead, then CASes the exact slot
-  sequence to a reaping state. It clears the slot only after winning that CAS.
+  proves that the recorded process instance is dead, then CASes its PID field
+  to a reaping sentinel after checking the start token. It clears the descriptor
+  and publishes the next free sequence only after winning that ownership CAS.
   A dead writer before the durable commit marker leaves an unrooted candidate;
   after the marker, recovery treats the new descriptor as current. Candidate
   pins cannot be dropped before this decision is recoverable.
