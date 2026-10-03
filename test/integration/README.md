@@ -26,6 +26,9 @@ workspace sibling target.
 The writer, reader, updater, and final reader are separate process invocations.
 The reader reserves the writer's old mapping address before opening the extent,
 then validates the reflected layout and indexes every saved vector value. The
+same root also contains real persistent `immer::map`, `immer::set`,
+`immer::table`, and boxed `immer::variant` values; the separate reader checks
+all 1,024 entries in each HAMT container and every variant payload element. The
 crash tests terminate writers after speculative allocation, after data flush,
 after the root-record body write, after the durable commit marker but before
 cache publication, and after cache publication. An already-attached reader

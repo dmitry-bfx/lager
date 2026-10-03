@@ -11,6 +11,10 @@
 
 #include <immer/vector.hpp>
 #include <immer/vector_transient.hpp>
+#include <immer/map.hpp>
+#include <immer/set.hpp>
+#include <immer/table.hpp>
+#include <immer/variant.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -33,15 +37,51 @@
 namespace persistent_round_trip {
 
 using values_type = immer::vector<int, immer::storage_memory_policy>;
+using map_type = immer::map<std::uint64_t,
+                            std::uint64_t,
+                            std::hash<std::uint64_t>,
+                            std::equal_to<std::uint64_t>,
+                            immer::storage_memory_policy>;
+using set_type = immer::set<std::uint64_t,
+                            std::hash<std::uint64_t>,
+                            std::equal_to<std::uint64_t>,
+                            immer::storage_memory_policy>;
+
+struct table_value
+{
+    std::uint64_t id;
+    std::uint64_t value;
+};
+
+using table_type = immer::table<table_value,
+                                immer::table_key_fn,
+                                std::hash<std::uint64_t>,
+                                std::equal_to<std::uint64_t>,
+                                immer::storage_memory_policy>;
+using variant_type = immer::variant<std::uint64_t, values_type>;
 
 struct root_state
 {
     values_type values;
+    map_type map_values;
+    set_type set_values;
+    table_type table_values;
+    variant_type variant_value;
 };
 
 } // namespace persistent_round_trip
 
-LAGER_STRUCT(persistent_round_trip, root_state, values);
+LAGER_STRUCT(persistent_round_trip,
+             table_value,
+             (std::uint64_t, id),
+             (std::uint64_t, value));
+LAGER_STRUCT(persistent_round_trip,
+             root_state,
+             (values_type, values),
+             (map_type, map_values),
+             (set_type, set_values),
+             (table_type, table_values),
+             (variant_type, variant_value));
 
 namespace {
 
@@ -49,6 +89,7 @@ using namespace persistent_round_trip;
 constexpr std::uint64_t store_id = 0x4c41474552505431ULL;
 constexpr std::uint64_t dependency_store_id = store_id + 1;
 constexpr std::size_t value_count = 100000;
+constexpr std::size_t indexed_container_count = 1024;
 constexpr std::size_t changed_index = 5137;
 constexpr int changed_value = -5137;
 constexpr std::size_t slot_bytes = 1024;
@@ -201,9 +242,31 @@ void create_store(const std::string& path)
         for (std::size_t i = 0; i < value_count; ++i)
             builder.push_back(static_cast<int>(i));
         auto values = std::move(builder).persistent();
-        const auto persisted_root = lager::persistent_layout(
-            root_state{values}, 1);
-        auto root = immer::make_storage<root_state>(root_state{values});
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> map_entries;
+        std::vector<std::uint64_t> set_entries;
+        std::vector<table_value> table_entries;
+        map_entries.reserve(indexed_container_count);
+        set_entries.reserve(indexed_container_count);
+        table_entries.reserve(indexed_container_count);
+        for (std::size_t i = 0; i < indexed_container_count; ++i) {
+            const auto key = static_cast<std::uint64_t>(i);
+            map_entries.emplace_back(key, key * 3 + 1);
+            set_entries.push_back(key * 5 + 2);
+            table_entries.push_back({key, key * 7 + 3});
+        }
+        root_state initial_root{values};
+        initial_root.map_values = map_type{map_entries.begin(), map_entries.end()};
+        initial_root.set_values = set_type{set_entries.begin(), set_entries.end()};
+        initial_root.table_values =
+            table_type{table_entries.begin(), table_entries.end()};
+        auto variant_builder = values_type{}.transient();
+        for (std::size_t i = 0; i < 64; ++i)
+            variant_builder.push_back(static_cast<int>(-static_cast<int>(i) - 1));
+        initial_root.variant_value = variant_type{
+            immer::in_place_index<1>,
+            std::move(variant_builder).persistent()};
+        const auto persisted_root = lager::persistent_layout(initial_root, 1);
+        auto root = immer::make_storage<root_state>(std::move(initial_root));
         auto journal = file.roots();
         auto store = lager::create_persistent_substore(
             runtime, {store_id}, root, journal);
@@ -225,6 +288,10 @@ void create_store(const std::string& path)
                             saved.values[value_count - 1] ==
                                 static_cast<int>(value_count - 1),
                         "writer indexed reads returned incorrect values");
+                require(saved.map_values.size() == indexed_container_count &&
+                            saved.set_values.size() == indexed_container_count &&
+                            saved.table_values.size() == indexed_container_count,
+                        "writer HAMT containers have the wrong sizes");
             });
     }
     std::cout << "writer committed " << value_count
@@ -261,6 +328,29 @@ void read_store(const std::string& path, bool updated)
                     "reader found an incorrect value at index " +
                         std::to_string(i));
         }
+        require(root.map_values.size() == indexed_container_count &&
+                    root.set_values.size() == indexed_container_count &&
+                    root.table_values.size() == indexed_container_count,
+                "reader found a HAMT container with the wrong size");
+        for (std::size_t i = 0; i < indexed_container_count; ++i) {
+            const auto key = static_cast<std::uint64_t>(i);
+            require(root.map_values.at(key) == key * 3 + 1,
+                    "reader found an incorrect persistent map value");
+            require(root.set_values.count(key * 5 + 2) == 1,
+                    "reader missed a persistent set value");
+            const auto* table_entry = root.table_values.find(key);
+            require(table_entry && table_entry->id == key &&
+                        table_entry->value == key * 7 + 3,
+                    "reader found an incorrect persistent table value");
+        }
+        require(root.variant_value.index() == 1,
+                "reader found the wrong persistent variant tag");
+        const auto& variant_values = root.variant_value.template get<1>();
+        require(variant_values.size() == 64,
+                "reader found the wrong persistent variant payload size");
+        for (std::size_t i = 0; i < variant_values.size(); ++i)
+            require(variant_values[i] == -static_cast<int>(i) - 1,
+                    "reader found an incorrect persistent variant payload");
     });
     std::cout << "separate reader recovered generation "
               << snapshot.generation() << " at relocated address "
