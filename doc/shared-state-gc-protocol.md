@@ -97,26 +97,24 @@ candidate/current roots as well as their source pins.
 ## Process-shared extension (not implemented)
 
 Multiprocess reclamation requires shared allocation metadata and a shared
-registration handshake. Persistent journal reader pins now encode
+writer-registration handshake. Persistent journal and shared-ephemeral reader pins encode
 `FREE`, `CLAIMING`, `ACTIVE`, and `RELEASING` in the low two sequence bits and
 advance the sequence on reuse. Root enumeration retries while a live claim is
 being published and validates the same active sequence before accepting its
 descriptor. The pin-registration crash test covers process death between PID
-claim and descriptor publication. Shared-ephemeral reader slots still use the
-older single active bit pattern. Both tables identify owners by PID alone, so
-PID reuse can make a dead pin appear live.
+claim and descriptor publication for persistent pins. Both tables identify
+owners by PID alone, so PID reuse can make a dead pin appear live.
 
 * A reader claims a slot before loading the root, writes its descriptor, then
   publishes `ACTIVE` with release ordering and validates the root sequence.
   GC treats `CLAIMING` as a reason to retry/wait, never as an absent root. A
   changed root makes the reader retry before it dereferences any graph node.
-  Persistent journal pins implement this scan protocol; shared-ephemeral pins
-  still need it.
+  Persistent journal and shared-ephemeral pins implement this scan protocol.
 * Final release transitions the exact active sequence to `RELEASING`, clears
   its descriptor, and publishes the next `FREE` sequence. A new reader can
   claim only `FREE`; GC double-reads state and sequence so it cannot combine
-  fields from two owners. This sequence protocol is implemented for persistent
-  journal pins but not yet shared-ephemeral pins.
+  fields from two owners. This sequence protocol is implemented in both pin
+  tables.
 * GC advances the shared allocation generation and captures roots at one
   shared synchronization point. Allocation reserves a shared slot with its
   generation before construction. Sweep may free only old-generation,
@@ -150,9 +148,9 @@ those tests pass.
   the captured roots. Mapped readers do not share this coordinator today.
 * **Pin release followed by slot reuse:** the controlled test releases a pin,
   immediately reuses its slot, then sends the old release token again. The
-  incremented sequence leaves the new pin active. The mapped table currently
-  serializes reuse by clearing the process ID last, but has no sequence token;
-  this needs a process-shared state/sequence protocol before reclamation.
+  incremented sequence leaves the new pin active. Both process-shared tables
+  now use monotonic sequence tokens, though a dedicated concurrent slot-reuse
+  interleaving test is still needed before reclamation.
 * **Pre-capture candidate published after capture:** the controlled test
   registers the candidate in a live transaction, pauses collection after root
   capture, and attempts publication from another thread. The candidate remains
@@ -175,9 +173,9 @@ the shared-ephemeral root/pin tables are process-shared. `shared_ptr` snapshot
 leases, runtime domain descriptors, extent-directory snapshots, and slot
 bitmaps are process-local. `roots_for_gc` combines durable current records
 with the process-shared reader/candidate pin table under a shared file lock;
-root publication uses an exclusive file lock. Persistent pin registration and
-enumeration now synchronize through the sequence handshake, but ephemeral
-reader pins do not. Snapshot acquisition validates the root after registering
+root publication uses an exclusive file lock. Persistent and ephemeral pin
+registration and enumeration now synchronize through the sequence handshake.
+Snapshot acquisition validates the root after registering
 and retries if it changed. Candidate storage is currently constructed before
 the commit-time candidate pin is published; no process-shared allocation
 generation or active-writer generation protects that gap. Reclamation is

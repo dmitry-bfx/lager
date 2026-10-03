@@ -84,6 +84,23 @@ class shared_ephemeral_storage
 {
     struct mapping_owner : std::enable_shared_from_this<mapping_owner>
     {
+        static constexpr std::uint64_t pin_state_mask = 3;
+        static constexpr std::uint64_t pin_free_state = 0;
+        static constexpr std::uint64_t pin_claiming_state = 1;
+        static constexpr std::uint64_t pin_active_state = 2;
+        static constexpr std::uint64_t pin_releasing_state = 3;
+
+        static std::uint64_t pin_state(std::uint64_t sequence) noexcept
+        {
+            return sequence & pin_state_mask;
+        }
+
+        static std::uint64_t next_free_pin_sequence(
+            std::uint64_t sequence) noexcept
+        {
+            return (sequence & ~pin_state_mask) + 4;
+        }
+
         struct root_bank
         {
             std::atomic<std::uint64_t> generation{0};
@@ -189,8 +206,12 @@ class shared_ephemeral_storage
         {
             reader_pin_lease(std::shared_ptr<mapping_owner> owner_,
                              std::size_t slot_,
-                             std::uint64_t process_id_)
-                : owner{std::move(owner_)}, slot{slot_}, process_id{process_id_}
+                             std::uint64_t process_id_,
+                             std::uint64_t active_sequence_)
+                : owner{std::move(owner_)},
+                  slot{slot_},
+                  process_id{process_id_},
+                  active_sequence{active_sequence_}
             {}
 
             ~reader_pin_lease()
@@ -200,19 +221,28 @@ class shared_ephemeral_storage
                                   process_id)
                     return;
                 auto& pin = owner->disk_header()->readers[slot];
-                pin.sequence.store(0, std::memory_order_seq_cst);
+                auto expected = active_sequence;
+                if (!pin.sequence.compare_exchange_strong(
+                        expected,
+                        active_sequence + 1,
+                        std::memory_order_seq_cst,
+                        std::memory_order_relaxed))
+                    return;
                 pin.root_bits.store(0, std::memory_order_relaxed);
                 pin.store_id.store(0, std::memory_order_relaxed);
                 pin.generation.store(0, std::memory_order_relaxed);
                 pin.layout_id.store(0, std::memory_order_relaxed);
                 pin.thread_id.store(0, std::memory_order_relaxed);
                 pin.process_id.store(0, std::memory_order_seq_cst);
+                pin.sequence.store(next_free_pin_sequence(active_sequence),
+                                   std::memory_order_seq_cst);
 #endif
             }
 
             std::shared_ptr<mapping_owner> owner;
             std::size_t slot;
             std::uint64_t process_id;
+            std::uint64_t active_sequence;
         };
 
         header* disk_header() const
@@ -334,6 +364,34 @@ class shared_ephemeral_storage
                             std::memory_order_seq_cst,
                             std::memory_order_relaxed))
                         continue;
+                    const auto free_sequence =
+                        slot.sequence.load(std::memory_order_seq_cst);
+                    if (pin_state(free_sequence) != pin_free_state) {
+                        auto owner = process_id;
+                        (void) slot.process_id.compare_exchange_strong(
+                            owner,
+                            0,
+                            std::memory_order_seq_cst,
+                            std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (free_sequence >
+                        std::numeric_limits<std::uint64_t>::max() - 4) {
+                        auto owner = process_id;
+                        (void) slot.process_id.compare_exchange_strong(
+                            owner,
+                            0,
+                            std::memory_order_seq_cst,
+                            std::memory_order_relaxed);
+                        throw std::overflow_error{
+                            "shared ephemeral pin sequence exhausted"};
+                    }
+                    const auto claiming_sequence =
+                        free_sequence + pin_claiming_state;
+                    const auto active_sequence =
+                        free_sequence + pin_active_state;
+                    slot.sequence.store(claiming_sequence,
+                                        std::memory_order_seq_cst);
                     slot.store_id.store(store_id, std::memory_order_relaxed);
                     slot.generation.store(generation,
                                           std::memory_order_relaxed);
@@ -343,12 +401,14 @@ class shared_ephemeral_storage
                                          std::memory_order_relaxed);
                     slot.thread_id.store(thread_id,
                                          std::memory_order_relaxed);
-                    slot.sequence.store(1, std::memory_order_seq_cst);
+                    slot.sequence.store(active_sequence,
+                                        std::memory_order_seq_cst);
                     try {
                         return std::shared_ptr<void>{
                             new reader_pin_lease{shared_from_this(),
                                                  i,
-                                                 process_id}};
+                                                 process_id,
+                                                 active_sequence}};
                     } catch (...) {
                         clear_reader_pin(slot, process_id);
                         throw;
@@ -365,36 +425,60 @@ class shared_ephemeral_storage
         {
             std::vector<shared_ephemeral_root_descriptor> result;
             for (auto& slot : disk_header()->readers) {
-                const auto process_id =
-                    slot.process_id.load(std::memory_order_seq_cst);
-                if (process_id == 0)
-                    continue;
-                if (!process_alive(process_id)) {
-                    clear_reader_pin(slot, process_id);
-                    continue;
+                bool complete = false;
+                for (int attempt = 0; attempt != 256; ++attempt) {
+                    const auto process_id =
+                        slot.process_id.load(std::memory_order_seq_cst);
+                    if (process_id == 0) {
+                        complete = true;
+                        break;
+                    }
+                    if (!process_alive(process_id)) {
+                        clear_reader_pin(slot, process_id);
+                        complete = true;
+                        break;
+                    }
+                    const auto sequence =
+                        slot.sequence.load(std::memory_order_seq_cst);
+                    const auto state = pin_state(sequence);
+                    if (state == pin_releasing_state) {
+                        complete = true;
+                        break;
+                    }
+                    if (state != pin_active_state) {
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    const auto store_id =
+                        slot.store_id.load(std::memory_order_relaxed);
+                    const auto generation =
+                        slot.generation.load(std::memory_order_relaxed);
+                    const auto root_bits =
+                        slot.root_bits.load(std::memory_order_relaxed);
+                    const auto layout_id =
+                        slot.layout_id.load(std::memory_order_relaxed);
+                    if (slot.sequence.load(std::memory_order_seq_cst) !=
+                            sequence ||
+                        slot.process_id.load(std::memory_order_seq_cst) !=
+                            process_id) {
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    if (store_id == 0 || root_bits == 0 || layout_id == 0)
+                        throw std::runtime_error{
+                            "shared ephemeral root pin is invalid"};
+                    result.push_back(
+                        {store_id,
+                         generation,
+                         0,
+                         immer::storage_ptr<void>::from_bits(root_bits),
+                         layout_id});
+                    complete = true;
+                    break;
                 }
-                if (slot.sequence.load(std::memory_order_seq_cst) != 1)
-                    continue;
-                const auto store_id =
-                    slot.store_id.load(std::memory_order_relaxed);
-                const auto generation =
-                    slot.generation.load(std::memory_order_relaxed);
-                const auto root_bits =
-                    slot.root_bits.load(std::memory_order_relaxed);
-                const auto layout_id =
-                    slot.layout_id.load(std::memory_order_relaxed);
-                if (slot.sequence.load(std::memory_order_seq_cst) != 1 ||
-                    slot.process_id.load(std::memory_order_seq_cst) !=
-                        process_id)
-                    continue;
-                if (store_id == 0 || root_bits == 0 || layout_id == 0)
+                if (!complete)
                     throw std::runtime_error{
-                        "shared ephemeral root pin is invalid"};
-                result.push_back({store_id,
-                                  generation,
-                                  0,
-                                  immer::storage_ptr<void>::from_bits(root_bits),
-                                  layout_id});
+                        "shared ephemeral reader pin registration did not settle"};
             }
             return result;
         }
@@ -438,12 +522,19 @@ class shared_ephemeral_storage
                     std::memory_order_seq_cst,
                     std::memory_order_relaxed))
                 return;
-            slot.sequence.store(0, std::memory_order_seq_cst);
+            const auto sequence =
+                slot.sequence.load(std::memory_order_seq_cst);
+            slot.sequence.store(
+                (sequence & ~pin_state_mask) | pin_releasing_state,
+                std::memory_order_seq_cst);
             slot.root_bits.store(0, std::memory_order_relaxed);
             slot.store_id.store(0, std::memory_order_relaxed);
             slot.generation.store(0, std::memory_order_relaxed);
             slot.layout_id.store(0, std::memory_order_relaxed);
             slot.thread_id.store(0, std::memory_order_relaxed);
+            const auto next_free = next_free_pin_sequence(sequence);
+            if (next_free >= sequence)
+                slot.sequence.store(next_free, std::memory_order_seq_cst);
             slot.process_id.store(0, std::memory_order_seq_cst);
         }
 
@@ -682,7 +773,7 @@ public:
 
             std::memset(address, 0, page);
             auto* header = ::new (address) mapping_owner::header{};
-            header->version = 3;
+            header->version = 4;
             header->extent_id = extent_id;
             header->slot_size = slot_size;
             header->slot_alignment = slot_alignment;
@@ -792,7 +883,7 @@ public:
                 static_cast<const mapping_owner::header*>(address);
             const auto header_ok =
                 std::memcmp(header->magic, magic, sizeof(magic)) == 0 &&
-                header->version == 3 &&
+                header->version == 4 &&
                 header->extent_id == expected_extent_id &&
                 header->slot_size == expected_slot_size &&
                 header->slot_alignment == expected_alignment &&
