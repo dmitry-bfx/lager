@@ -97,21 +97,26 @@ candidate/current roots as well as their source pins.
 ## Process-shared extension (not implemented)
 
 Multiprocess reclamation requires shared allocation metadata and a shared
-registration handshake; the current process-local bitmaps and mapped root pin
-tables are insufficient. The eventual shared slot protocol must distinguish
-`FREE`, `CLAIMING`, `ACTIVE`, and `RELEASING` states and tag every claim with a
-monotonic slot sequence plus process identity. Process identity must include a
-start-time or equivalent reuse-resistant token; a bare PID can refer to an
-unrelated process after PID reuse.
+registration handshake. Persistent journal reader pins now encode
+`FREE`, `CLAIMING`, `ACTIVE`, and `RELEASING` in the low two sequence bits and
+advance the sequence on reuse. Root enumeration retries while a live claim is
+being published and validates the same active sequence before accepting its
+descriptor. The pin-registration crash test covers process death between PID
+claim and descriptor publication. Shared-ephemeral reader slots still use the
+older single active bit pattern. Both tables identify owners by PID alone, so
+PID reuse can make a dead pin appear live.
 
 * A reader claims a slot before loading the root, writes its descriptor, then
   publishes `ACTIVE` with release ordering and validates the root sequence.
   GC treats `CLAIMING` as a reason to retry/wait, never as an absent root. A
   changed root makes the reader retry before it dereferences any graph node.
+  Persistent journal pins implement this scan protocol; shared-ephemeral pins
+  still need it.
 * Final release transitions the exact active sequence to `RELEASING`, clears
-  its descriptor, and publishes `FREE`. A new reader can claim only `FREE`;
-  GC double-reads state and sequence so it cannot combine fields from two
-  owners.
+  its descriptor, and publishes the next `FREE` sequence. A new reader can
+  claim only `FREE`; GC double-reads state and sequence so it cannot combine
+  fields from two owners. This sequence protocol is implemented for persistent
+  journal pins but not yet shared-ephemeral pins.
 * GC advances the shared allocation generation and captures roots at one
   shared synchronization point. Allocation reserves a shared slot with its
   generation before construction. Sweep may free only old-generation,
@@ -170,12 +175,13 @@ the shared-ephemeral root/pin tables are process-shared. `shared_ptr` snapshot
 leases, runtime domain descriptors, extent-directory snapshots, and slot
 bitmaps are process-local. `roots_for_gc` combines durable current records
 with the process-shared reader/candidate pin table under a shared file lock;
-root publication uses an exclusive file lock. Reader pin registration itself
-publishes the process ID before filling the descriptor and has no matching
-collector lock. Snapshot acquisition validates the root after registering and
-retries if it changed, but candidate storage is currently constructed before
-the commit-time candidate pin is published. Reclamation is disabled for mapped
-extents, so that allocation-to-pin gap is not safe for reuse today.
+root publication uses an exclusive file lock. Persistent pin registration and
+enumeration now synchronize through the sequence handshake, but ephemeral
+reader pins do not. Snapshot acquisition validates the root after registering
+and retries if it changed. Candidate storage is currently constructed before
+the commit-time candidate pin is published; no process-shared allocation
+generation or active-writer generation protects that gap. Reclamation is
+disabled for mapped extents, so candidate slot reuse remains unsafe today.
 
 Existing crash failpoints exercise writer death at allocation, data flush,
 root-record body write, durable marker, and cache publication, plus reader death

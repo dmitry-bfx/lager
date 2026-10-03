@@ -141,6 +141,22 @@ class persistent_root_journal
             std::atomic<std::uint64_t> thread_id{0};
         } readers[24];
     };
+    static constexpr std::uint64_t reader_pin_state_mask = 3;
+    static constexpr std::uint64_t reader_pin_free_state = 0;
+    static constexpr std::uint64_t reader_pin_claiming_state = 1;
+    static constexpr std::uint64_t reader_pin_active_state = 2;
+    static constexpr std::uint64_t reader_pin_releasing_state = 3;
+
+    static std::uint64_t reader_pin_state(std::uint64_t sequence) noexcept
+    {
+        return sequence & reader_pin_state_mask;
+    }
+
+    static std::uint64_t next_free_reader_pin_sequence(
+        std::uint64_t sequence) noexcept
+    {
+        return (sequence & ~reader_pin_state_mask) + 4;
+    }
     static_assert(sizeof(disk_superblock) == 24,
                   "root journal superblock layout changed");
     static_assert(sizeof(disk_root_record) == 64,
@@ -150,7 +166,7 @@ class persistent_root_journal
                   "persistent root cache must fit in the journal header page");
     static constexpr std::uint32_t format_version = 5;
     static constexpr std::size_t root_table_offset = 64;
-    static constexpr std::uint64_t root_table_magic = 0x4c41474552544335ULL;
+    static constexpr std::uint64_t root_table_magic = 0x4c41474552544336ULL;
     static constexpr std::uint64_t publication_stage_mask = 3;
     static constexpr std::uint64_t publication_stage_precommit = 1;
     static constexpr std::uint64_t publication_stage_durable = 2;
@@ -381,15 +397,46 @@ public:
                         std::memory_order_relaxed))
                     continue;
                 test_failpoint("pin-registration");
+                const auto free_sequence =
+                    slot.sequence.load(std::memory_order_seq_cst);
+                if (reader_pin_state(free_sequence) !=
+                    reader_pin_free_state) {
+                    auto owner = process_id;
+                    (void) slot.process_id.compare_exchange_strong(
+                        owner,
+                        0,
+                        std::memory_order_seq_cst,
+                        std::memory_order_relaxed);
+                    continue;
+                }
+                if (free_sequence >
+                    std::numeric_limits<std::uint64_t>::max() - 4) {
+                    auto owner = process_id;
+                    (void) slot.process_id.compare_exchange_strong(
+                        owner,
+                        0,
+                        std::memory_order_seq_cst,
+                        std::memory_order_relaxed);
+                    throw std::overflow_error{
+                        "persistent reader pin sequence exhausted"};
+                }
+                const auto claiming_sequence = free_sequence +
+                                               reader_pin_claiming_state;
+                const auto active_sequence = free_sequence +
+                                             reader_pin_active_state;
+                slot.sequence.store(claiming_sequence,
+                                    std::memory_order_seq_cst);
                 slot.store_id.store(store_id, std::memory_order_relaxed);
                 slot.generation.store(generation, std::memory_order_relaxed);
                 slot.root_bits.store(root.bits(), std::memory_order_relaxed);
                 slot.layout_id.store(layout_id, std::memory_order_relaxed);
                 slot.thread_id.store(raw_thread_id, std::memory_order_relaxed);
-                slot.sequence.store(1, std::memory_order_seq_cst);
+                slot.sequence.store(active_sequence,
+                                    std::memory_order_seq_cst);
                 try {
                     return std::shared_ptr<void>{
-                        new reader_pin_lease{state_, i, process_id}};
+                        new reader_pin_lease{
+                            state_, i, process_id, active_sequence}};
                 } catch (...) {
                     clear_dead_reader_pin(slot, process_id);
                     throw;
@@ -414,34 +461,58 @@ public:
         std::vector<durable_root_descriptor> result;
         auto* table = root_table();
         for (auto& slot : table->readers) {
-            const auto process_id =
-                slot.process_id.load(std::memory_order_seq_cst);
-            if (process_id == 0)
-                continue;
-            if (!process_alive(process_id)) {
-                clear_dead_reader_pin(slot, process_id);
-                continue;
+            bool complete = false;
+            for (int attempt = 0; attempt != 256; ++attempt) {
+                const auto process_id =
+                    slot.process_id.load(std::memory_order_seq_cst);
+                if (process_id == 0) {
+                    complete = true;
+                    break;
+                }
+                if (!process_alive(process_id)) {
+                    clear_dead_reader_pin(slot, process_id);
+                    complete = true;
+                    break;
+                }
+                const auto sequence =
+                    slot.sequence.load(std::memory_order_seq_cst);
+                const auto state = reader_pin_state(sequence);
+                if (state == reader_pin_releasing_state) {
+                    complete = true;
+                    break;
+                }
+                if (state != reader_pin_active_state) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                const auto store_id =
+                    slot.store_id.load(std::memory_order_relaxed);
+                const auto generation =
+                    slot.generation.load(std::memory_order_relaxed);
+                const auto root_bits =
+                    slot.root_bits.load(std::memory_order_relaxed);
+                const auto layout_id =
+                    slot.layout_id.load(std::memory_order_relaxed);
+                if (slot.sequence.load(std::memory_order_seq_cst) != sequence ||
+                    slot.process_id.load(std::memory_order_seq_cst) !=
+                        process_id) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                if (store_id == 0 || root_bits == 0 || layout_id == 0)
+                    throw std::runtime_error{
+                        "persistent root reader pin is invalid"};
+                result.push_back({store_id,
+                                  generation,
+                                  0,
+                                  immer::storage_ptr<void>::from_bits(root_bits),
+                                  layout_id});
+                complete = true;
+                break;
             }
-            if (slot.sequence.load(std::memory_order_seq_cst) != 1)
-                continue;
-            const auto store_id = slot.store_id.load(std::memory_order_relaxed);
-            const auto generation =
-                slot.generation.load(std::memory_order_relaxed);
-            const auto root_bits =
-                slot.root_bits.load(std::memory_order_relaxed);
-            const auto layout_id =
-                slot.layout_id.load(std::memory_order_relaxed);
-            if (slot.sequence.load(std::memory_order_seq_cst) != 1 ||
-                slot.process_id.load(std::memory_order_seq_cst) != process_id)
-                continue;
-            if (store_id == 0 || root_bits == 0 || layout_id == 0)
+            if (!complete)
                 throw std::runtime_error{
-                    "persistent root reader pin is invalid"};
-            result.push_back({store_id,
-                              generation,
-                              0,
-                              immer::storage_ptr<void>::from_bits(root_bits),
-                              layout_id});
+                    "persistent root reader pin registration did not settle"};
         }
         return result;
 #endif
@@ -597,8 +668,12 @@ private:
     {
         reader_pin_lease(std::shared_ptr<journal_state> state_,
                          std::size_t slot_,
-                         std::uint64_t process_id_)
-            : state{std::move(state_)}, slot{slot_}, process_id{process_id_}
+                         std::uint64_t process_id_,
+                         std::uint64_t active_sequence_)
+            : state{std::move(state_)},
+              slot{slot_},
+              process_id{process_id_},
+              active_sequence{active_sequence_}
         {}
 
         ~reader_pin_lease()
@@ -610,18 +685,29 @@ private:
                 static_cast<std::byte*>(state->control_mapping) +
                 root_table_offset);
             auto& pin = table->readers[slot];
-            pin.sequence.store(0, std::memory_order_seq_cst);
+            auto expected = active_sequence;
+            if (!pin.sequence.compare_exchange_strong(
+                    expected,
+                    active_sequence + 1,
+                    std::memory_order_seq_cst,
+                    std::memory_order_relaxed))
+                return;
             pin.root_bits.store(0, std::memory_order_relaxed);
             pin.store_id.store(0, std::memory_order_relaxed);
             pin.generation.store(0, std::memory_order_relaxed);
             pin.layout_id.store(0, std::memory_order_relaxed);
             pin.thread_id.store(0, std::memory_order_relaxed);
             pin.process_id.store(0, std::memory_order_seq_cst);
+            pin.sequence.store(
+                persistent_root_journal::next_free_reader_pin_sequence(
+                    active_sequence),
+                std::memory_order_seq_cst);
         }
 
         std::shared_ptr<journal_state> state;
         std::size_t slot;
         std::uint64_t process_id;
+        std::uint64_t active_sequence;
     };
 
     class file_lock
@@ -730,12 +816,20 @@ private:
                 std::memory_order_seq_cst,
                 std::memory_order_relaxed))
             return;
-        slot.sequence.store(0, std::memory_order_seq_cst);
+        const auto sequence =
+            slot.sequence.load(std::memory_order_seq_cst);
+        slot.sequence.store(
+            (sequence & ~reader_pin_state_mask) |
+                reader_pin_releasing_state,
+            std::memory_order_seq_cst);
         slot.root_bits.store(0, std::memory_order_relaxed);
         slot.store_id.store(0, std::memory_order_relaxed);
         slot.generation.store(0, std::memory_order_relaxed);
         slot.layout_id.store(0, std::memory_order_relaxed);
         slot.thread_id.store(0, std::memory_order_relaxed);
+        const auto next_free = next_free_reader_pin_sequence(sequence);
+        if (next_free >= sequence)
+            slot.sequence.store(next_free, std::memory_order_seq_cst);
         slot.process_id.store(0, std::memory_order_seq_cst);
     }
 
