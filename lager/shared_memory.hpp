@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +51,12 @@ struct shared_ephemeral_read_dependency
     std::uint64_t generation = 0;
 };
 
+struct shared_ephemeral_root_pin
+{
+    shared_ephemeral_root_descriptor descriptor;
+    std::shared_ptr<void> lifetime;
+};
+
 class shared_ephemeral_write_conflict : public std::runtime_error
 {
 public:
@@ -74,7 +82,7 @@ inline void throw_shared_memory_errno(const char* operation)
  */
 class shared_ephemeral_storage
 {
-    struct mapping_owner
+    struct mapping_owner : std::enable_shared_from_this<mapping_owner>
     {
         struct root_bank
         {
@@ -91,6 +99,17 @@ class shared_ephemeral_storage
             root_bank banks[2];
         };
 
+        struct reader_slot
+        {
+            std::atomic<std::uint64_t> process_id{0};
+            std::atomic<std::uint64_t> sequence{0};
+            std::atomic<std::uint64_t> store_id{0};
+            std::atomic<std::uint64_t> generation{0};
+            std::atomic<std::uint64_t> root_bits{0};
+            std::atomic<std::uint64_t> layout_id{0};
+            std::atomic<std::uint64_t> thread_id{0};
+        };
+
         struct header
         {
             char magic[8];
@@ -104,6 +123,7 @@ class shared_ephemeral_storage
             std::uint64_t next_slot_check;
             std::atomic<std::uint64_t> global_generation{0};
             root_slot roots[32];
+            reader_slot readers[24];
         };
 
         mapping_owner(std::string name_,
@@ -135,7 +155,10 @@ class shared_ephemeral_storage
             if (!disk_header()->global_generation.is_lock_free() ||
                 !disk_header()->roots[0].store_id.is_lock_free() ||
                 !disk_header()->roots[0].sequence.is_lock_free() ||
-                !disk_header()->roots[0].banks[0].generation.is_lock_free())
+                !disk_header()->roots[0].banks[0].generation.is_lock_free() ||
+                !disk_header()->readers[0].process_id.is_lock_free() ||
+                !disk_header()->readers[0].sequence.is_lock_free() ||
+                !disk_header()->readers[0].root_bits.is_lock_free())
                 throw std::runtime_error{
                     "shared root publication requires lock-free 64-bit atomics"};
 #endif
@@ -161,6 +184,36 @@ class shared_ephemeral_storage
                 ::shm_unlink(name.c_str());
 #endif
         }
+
+        struct reader_pin_lease
+        {
+            reader_pin_lease(std::shared_ptr<mapping_owner> owner_,
+                             std::size_t slot_,
+                             std::uint64_t process_id_)
+                : owner{std::move(owner_)}, slot{slot_}, process_id{process_id_}
+            {}
+
+            ~reader_pin_lease()
+            {
+#if !defined(_WIN32)
+                if (!owner || static_cast<std::uint64_t>(::getpid()) !=
+                                  process_id)
+                    return;
+                auto& pin = owner->disk_header()->readers[slot];
+                pin.sequence.store(0, std::memory_order_seq_cst);
+                pin.root_bits.store(0, std::memory_order_relaxed);
+                pin.store_id.store(0, std::memory_order_relaxed);
+                pin.generation.store(0, std::memory_order_relaxed);
+                pin.layout_id.store(0, std::memory_order_relaxed);
+                pin.thread_id.store(0, std::memory_order_relaxed);
+                pin.process_id.store(0, std::memory_order_seq_cst);
+#endif
+            }
+
+            std::shared_ptr<mapping_owner> owner;
+            std::size_t slot;
+            std::uint64_t process_id;
+        };
 
         header* disk_header() const
         {
@@ -210,7 +263,7 @@ class shared_ephemeral_storage
                     continue;
                 for (;;) {
                     const auto sequence =
-                        slot.sequence.load(std::memory_order_acquire);
+                        slot.sequence.load(std::memory_order_seq_cst);
                     if (sequence == 0)
                         throw std::out_of_range{
                             "shared ephemeral root is not published"};
@@ -223,7 +276,7 @@ class shared_ephemeral_storage
                         bank.root_bits.load(std::memory_order_relaxed);
                     const auto layout_id =
                         bank.layout_id.load(std::memory_order_relaxed);
-                    if (slot.sequence.load(std::memory_order_acquire) !=
+                    if (slot.sequence.load(std::memory_order_seq_cst) !=
                         sequence)
                         continue;
                     if (generation == 0 || root_bits == 0 || layout_id == 0 ||
@@ -238,6 +291,170 @@ class shared_ephemeral_storage
                 }
             }
             throw std::out_of_range{"shared ephemeral store is not registered"};
+        }
+
+        shared_ephemeral_root_pin pin_current_root(
+            std::uint64_t store_id)
+        {
+            for (;;) {
+                const auto before = read_root(store_id);
+                auto lifetime = pin_root_handle(before.store_id,
+                                                before.generation,
+                                                before.root,
+                                                before.layout_id);
+                const auto after = read_root(store_id);
+                if (before.generation == after.generation &&
+                    before.root == after.root &&
+                    before.layout_id == after.layout_id)
+                    return {after, std::move(lifetime)};
+            }
+        }
+
+        std::shared_ptr<void> pin_root_handle(
+            std::uint64_t store_id,
+            std::uint64_t generation,
+            immer::storage_ptr<void> root,
+            std::uint64_t layout_id)
+        {
+            if (store_id == 0 || !root || layout_id == 0)
+                throw std::invalid_argument{
+                    "shared ephemeral root pin is invalid"};
+            const auto process_id = static_cast<std::uint64_t>(::getpid());
+            const auto thread_id =
+                static_cast<std::uint64_t>(std::hash<std::thread::id>{}(
+                    std::this_thread::get_id()));
+            auto* header = disk_header();
+            for (int attempt = 0; attempt != 2; ++attempt) {
+                for (std::size_t i = 0; i < std::size(header->readers); ++i) {
+                    auto& slot = header->readers[i];
+                    std::uint64_t empty = 0;
+                    if (!slot.process_id.compare_exchange_strong(
+                            empty,
+                            process_id,
+                            std::memory_order_seq_cst,
+                            std::memory_order_relaxed))
+                        continue;
+                    slot.store_id.store(store_id, std::memory_order_relaxed);
+                    slot.generation.store(generation,
+                                          std::memory_order_relaxed);
+                    slot.root_bits.store(root.bits(),
+                                         std::memory_order_relaxed);
+                    slot.layout_id.store(layout_id,
+                                         std::memory_order_relaxed);
+                    slot.thread_id.store(thread_id,
+                                         std::memory_order_relaxed);
+                    slot.sequence.store(1, std::memory_order_seq_cst);
+                    try {
+                        return std::shared_ptr<void>{
+                            new reader_pin_lease{shared_from_this(),
+                                                 i,
+                                                 process_id}};
+                    } catch (...) {
+                        clear_reader_pin(slot, process_id);
+                        throw;
+                    }
+                }
+                if (attempt == 0)
+                    reap_dead_reader_pins();
+            }
+            throw std::length_error{
+                "shared ephemeral root pin table has reached its 24-slot capacity"};
+        }
+
+        std::vector<shared_ephemeral_root_descriptor> pinned_roots() const
+        {
+            std::vector<shared_ephemeral_root_descriptor> result;
+            for (auto& slot : disk_header()->readers) {
+                const auto process_id =
+                    slot.process_id.load(std::memory_order_seq_cst);
+                if (process_id == 0)
+                    continue;
+                if (!process_alive(process_id)) {
+                    clear_reader_pin(slot, process_id);
+                    continue;
+                }
+                if (slot.sequence.load(std::memory_order_seq_cst) != 1)
+                    continue;
+                const auto store_id =
+                    slot.store_id.load(std::memory_order_relaxed);
+                const auto generation =
+                    slot.generation.load(std::memory_order_relaxed);
+                const auto root_bits =
+                    slot.root_bits.load(std::memory_order_relaxed);
+                const auto layout_id =
+                    slot.layout_id.load(std::memory_order_relaxed);
+                if (slot.sequence.load(std::memory_order_seq_cst) != 1 ||
+                    slot.process_id.load(std::memory_order_seq_cst) !=
+                        process_id)
+                    continue;
+                if (store_id == 0 || root_bits == 0 || layout_id == 0)
+                    throw std::runtime_error{
+                        "shared ephemeral root pin is invalid"};
+                result.push_back({store_id,
+                                  generation,
+                                  0,
+                                  immer::storage_ptr<void>::from_bits(root_bits),
+                                  layout_id});
+            }
+            return result;
+        }
+
+        std::vector<shared_ephemeral_root_descriptor> roots_for_gc() const
+        {
+            lock(LOCK_SH);
+            unlock_guard unlock{fd};
+            std::vector<shared_ephemeral_root_descriptor> result;
+            for (const auto& slot : disk_header()->roots) {
+                const auto store_id =
+                    slot.store_id.load(std::memory_order_acquire);
+                if (store_id != 0 &&
+                    slot.sequence.load(std::memory_order_seq_cst) != 0)
+                    result.push_back(read_root(store_id));
+            }
+            auto pins = pinned_roots();
+            result.insert(result.end(), pins.begin(), pins.end());
+            return result;
+        }
+
+        static bool process_alive(std::uint64_t process_id) noexcept
+        {
+            if (process_id == 0)
+                return false;
+            if (process_id > static_cast<std::uint64_t>(
+                                 std::numeric_limits<pid_t>::max()))
+                return true;
+            if (::kill(static_cast<pid_t>(process_id), 0) == 0)
+                return true;
+            return errno != ESRCH;
+        }
+
+        static void clear_reader_pin(reader_slot& slot,
+                                     std::uint64_t process_id) noexcept
+        {
+            auto expected = process_id;
+            if (!slot.process_id.compare_exchange_strong(
+                    expected,
+                    std::numeric_limits<std::uint64_t>::max(),
+                    std::memory_order_seq_cst,
+                    std::memory_order_relaxed))
+                return;
+            slot.sequence.store(0, std::memory_order_seq_cst);
+            slot.root_bits.store(0, std::memory_order_relaxed);
+            slot.store_id.store(0, std::memory_order_relaxed);
+            slot.generation.store(0, std::memory_order_relaxed);
+            slot.layout_id.store(0, std::memory_order_relaxed);
+            slot.thread_id.store(0, std::memory_order_relaxed);
+            slot.process_id.store(0, std::memory_order_seq_cst);
+        }
+
+        void reap_dead_reader_pins() const
+        {
+            for (auto& slot : disk_header()->readers) {
+                const auto process_id =
+                    slot.process_id.load(std::memory_order_seq_cst);
+                if (process_id != 0 && !process_alive(process_id))
+                    clear_reader_pin(slot, process_id);
+            }
         }
 
         shared_ephemeral_root_descriptor publish_root(
@@ -267,7 +484,7 @@ class shared_ephemeral_storage
                     break;
                 }
                 if ((registered == 0 ||
-                     slot.sequence.load(std::memory_order_acquire) == 0) &&
+                     slot.sequence.load(std::memory_order_seq_cst) == 0) &&
                     empty_slot == nullptr)
                     empty_slot = &slot;
             }
@@ -280,7 +497,7 @@ class shared_ephemeral_storage
             }
 
             std::uint64_t sequence =
-                target->sequence.load(std::memory_order_acquire);
+                target->sequence.load(std::memory_order_seq_cst);
             if (sequence == 0) {
                 if (expected_generation != 0)
                     throw std::runtime_error{
@@ -324,7 +541,8 @@ class shared_ephemeral_storage
                                             std::memory_order_relaxed);
             if (is_new || sequence == 0)
                 target->store_id.store(store_id, std::memory_order_release);
-            target->sequence.store(next_sequence, std::memory_order_release);
+            target->sequence.store(next_sequence,
+                                   std::memory_order_seq_cst);
             return {store_id,
                     generation,
                     read_watermark,
@@ -464,7 +682,7 @@ public:
 
             std::memset(address, 0, page);
             auto* header = ::new (address) mapping_owner::header{};
-            header->version = 2;
+            header->version = 3;
             header->extent_id = extent_id;
             header->slot_size = slot_size;
             header->slot_alignment = slot_alignment;
@@ -574,7 +792,7 @@ public:
                 static_cast<const mapping_owner::header*>(address);
             const auto header_ok =
                 std::memcmp(header->magic, magic, sizeof(magic)) == 0 &&
-                header->version == 2 &&
+                header->version == 3 &&
                 header->extent_id == expected_extent_id &&
                 header->slot_size == expected_slot_size &&
                 header->slot_alignment == expected_alignment &&
@@ -661,6 +879,53 @@ public:
         if (!mapping_)
             throw std::logic_error{"shared ephemeral arena is empty"};
         return mapping_->read_root(store_id);
+#endif
+    }
+
+    shared_ephemeral_root_pin pin_current_root(std::uint64_t store_id) const
+    {
+#if defined(_WIN32)
+        (void) store_id;
+        throw std::runtime_error{
+            "shared ephemeral storage currently requires POSIX"};
+#else
+        if (!mapping_)
+            throw std::logic_error{"shared ephemeral arena is empty"};
+        return mapping_->pin_current_root(store_id);
+#endif
+    }
+
+    std::shared_ptr<void> pin_root_handle(std::uint64_t store_id,
+                                          std::uint64_t generation,
+                                          immer::storage_ptr<void> root,
+                                          std::uint64_t layout_id) const
+    {
+#if defined(_WIN32)
+        (void) store_id;
+        (void) generation;
+        (void) root;
+        (void) layout_id;
+        throw std::runtime_error{
+            "shared ephemeral storage currently requires POSIX"};
+#else
+        if (!mapping_)
+            throw std::logic_error{"shared ephemeral arena is empty"};
+        return mapping_->pin_root_handle(store_id,
+                                         generation,
+                                         root,
+                                         layout_id);
+#endif
+    }
+
+    std::vector<shared_ephemeral_root_descriptor> roots_for_gc() const
+    {
+#if defined(_WIN32)
+        throw std::runtime_error{
+            "shared ephemeral storage currently requires POSIX"};
+#else
+        if (!mapping_)
+            throw std::logic_error{"shared ephemeral arena is empty"};
+        return mapping_->roots_for_gc();
 #endif
     }
 

@@ -369,6 +369,33 @@ int shared_ephemeral_writer_child(const std::string& name,
     return 0;
 }
 
+int shared_ephemeral_reader_child(const std::string& name,
+                                  std::uint64_t store_id,
+                                  std::uint64_t layout_id,
+                                  int ready_fd,
+                                  int release_fd)
+{
+    auto shared = lager::shared_ephemeral_storage::open(
+        name, 73, slot_bytes, slot_alignment, extent_layout_id);
+    lager::shared_store_runtime runtime;
+    runtime.publish_extent(shared.view());
+    auto store = runtime.attach_shared_ephemeral_root(
+        {store_id}, layout_id, shared);
+    const auto snapshot = runtime.read(store);
+    const char ready = 'r';
+    if (::write(ready_fd, &ready, 1) != 1)
+        return 4;
+    char release = 0;
+    if (::read(release_fd, &release, 1) != 1)
+        return 5;
+    snapshot.with_root<root_state>(layout_id, [](const auto& root) {
+        require(root.values[0] == 1,
+                "old shared ephemeral reader snapshot changed after commit");
+    });
+    ::_exit(0);
+    return 0;
+}
+
 void shared_ephemeral_process_round_trip()
 {
     const auto name = "/lager_ephemeral_" + std::to_string(::getpid());
@@ -402,6 +429,37 @@ void shared_ephemeral_process_round_trip()
     auto stale_handle = immer::make_storage<root_state>(
         std::move(stale_candidate));
 
+    int reader_ready[2];
+    int reader_release[2];
+    require(::pipe(reader_ready) == 0 && ::pipe(reader_release) == 0,
+            "could not create shared ephemeral reader pipes");
+    const auto reader_child = ::fork();
+    require(reader_child >= 0,
+            "fork failed for shared ephemeral pinned reader");
+    if (reader_child == 0) {
+        ::close(reader_ready[0]);
+        ::close(reader_release[1]);
+        ::_exit(shared_ephemeral_reader_child(name,
+                                              id,
+                                              layout_id,
+                                              reader_ready[1],
+                                              reader_release[0]));
+    }
+    ::close(reader_ready[1]);
+    ::close(reader_release[0]);
+    char reader_signal = 0;
+    require(::read(reader_ready[0], &reader_signal, 1) == 1,
+            "shared ephemeral reader did not pin its snapshot");
+    auto roots_with_reader = shared.roots_for_gc();
+    require(std::any_of(roots_with_reader.begin(),
+                        roots_with_reader.end(),
+                        [&](const auto& root) {
+                            return root.store_id == id &&
+                                   root.generation == stale.base().generation() &&
+                                   root.root == stale.base().get();
+                        }),
+            "shared ephemeral pin was not visible to another process");
+
     const auto child = ::fork();
     require(child >= 0, "fork failed for shared ephemeral store test");
     if (child == 0) {
@@ -415,6 +473,40 @@ void shared_ephemeral_process_round_trip()
     require(::waitpid(child, &status, 0) == child && WIFEXITED(status) &&
                 WEXITSTATUS(status) == 0,
             "separate shared ephemeral writer failed");
+    auto shared_roots = shared.roots_for_gc();
+    require(std::any_of(shared_roots.begin(),
+                        shared_roots.end(),
+                        [&](const auto& root) {
+                            return root.store_id == id &&
+                                   root.generation == stale.base().generation() &&
+                                   root.root == stale.base().get();
+                        }),
+            "shared ephemeral GC roots omitted an old pinned snapshot");
+    auto current = runtime.read(store);
+    lager::tracing_collector collector{current.extents()};
+    collector.add_shared_ephemeral_roots<root_state>(shared, layout_id);
+    require(collector.collect() == 0,
+            "shared ephemeral collector reclaimed a mapped slot");
+    const char release = 'g';
+    require(::write(reader_release[1], &release, 1) == 1,
+            "could not release shared ephemeral reader");
+    int reader_status = 0;
+    require(::waitpid(reader_child, &reader_status, 0) == reader_child &&
+                WIFEXITED(reader_status) && WEXITSTATUS(reader_status) == 0,
+            "shared ephemeral pinned reader did not finish cleanly");
+    ::close(reader_ready[0]);
+    ::close(reader_release[1]);
+    const auto roots_after_reader = shared.roots_for_gc();
+    const auto old_root_pins = std::count_if(
+        roots_after_reader.begin(),
+        roots_after_reader.end(),
+        [&](const auto& root) {
+            return root.store_id == id &&
+                   root.generation == stale.base().generation() &&
+                   root.root == stale.base().get();
+        });
+    require(old_root_pins == 1,
+            "shared ephemeral reader process left its root pin registered");
     bool conflicted = false;
     try {
         (void) stale.commit(stale_handle.template rebind<void>());

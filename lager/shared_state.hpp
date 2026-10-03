@@ -661,12 +661,14 @@ public:
     shared_snapshot<T> read(substore<T, Policy> store) const
     {
         auto selected = find_domain<T, Policy>(store.id());
-        std::shared_ptr<void> persistent_pin;
+        std::shared_ptr<void> root_pin;
         if constexpr (std::is_same_v<T, immer::storage_ptr<void>> &&
                       std::is_same_v<Policy, shared_ephemeral_policy>) {
             if (selected->shared_root_channel) {
-                const auto latest =
-                    selected->shared_root_channel->read_root(store.id().value);
+                auto pinned =
+                    selected->shared_root_channel->pin_current_root(
+                        store.id().value);
+                const auto latest = pinned.descriptor;
                 if (latest.layout_id !=
                     std::atomic_load_explicit(&selected->current,
                                               std::memory_order_acquire)
@@ -674,6 +676,7 @@ public:
                     throw std::invalid_argument{
                         "shared ephemeral root layout changed in another process"};
                 adopt_shared_ephemeral_root(selected, latest);
+                root_pin = std::move(pinned.lifetime);
             }
         }
         if constexpr (std::is_same_v<T, immer::storage_ptr<void>> &&
@@ -690,14 +693,14 @@ public:
                         "durable root layout changed in another process"};
                 (void) extents_.pin().resolve(latest.root);
                 adopt_persistent_root(selected, latest);
-                persistent_pin = std::move(pinned.lifetime);
+                root_pin = std::move(pinned.lifetime);
             }
         }
         return shared_snapshot<T>{
             std::atomic_load_explicit(&selected->current,
                                       std::memory_order_acquire),
             extents_.pin(),
-            std::move(persistent_pin)};
+            std::move(root_pin)};
     }
 
     //! Resolve a shared substore selected from an ordinary Lager reader or
@@ -1049,6 +1052,13 @@ private:
             !extents_.pin().is_allocated(candidate))
             throw std::invalid_argument{
                 "shared ephemeral candidate is not in an allocated shared extent"};
+
+        auto candidate_pin = target->shared_root_channel->pin_root_handle(
+            store.id().value,
+            base.generation(),
+            candidate,
+            base.layout_id());
+        (void) candidate_pin;
 
         std::lock_guard<std::mutex> commit_lock{target->commit_mutex};
         const auto channel = target->shared_root_channel;

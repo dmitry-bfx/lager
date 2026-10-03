@@ -240,6 +240,25 @@ public:
             add(root);
     }
 
+    //! Add current roots and process-shared reader/transaction pins from one
+    //! shared-ephemeral arena for a reflected root layout.
+    template <typename RootT>
+    void add_shared_ephemeral_roots(
+        const shared_ephemeral_storage& storage,
+        std::uint64_t expected_layout_id)
+    {
+        static_assert(!std::is_void<RootT>::value,
+                      "shared GC roots need a concrete reflected type");
+        if (expected_layout_id == 0)
+            throw std::invalid_argument{
+                "shared GC layout ID must be nonzero"};
+        for (const auto& root : storage.roots_for_gc()) {
+            if (root.layout_id != expected_layout_id)
+                continue;
+            add_root_as<RootT>(root.root);
+        }
+    }
+
     std::size_t collect()
     {
         bool marking = false;
