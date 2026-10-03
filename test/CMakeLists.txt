@@ -46,8 +46,8 @@ endfunction()
 
 find_package(Qt5 COMPONENTS Core Concurrent)
 
-add_custom_target(tests COMMENT "Build all the unit tests.")
-add_dependencies(check tests)
+add_custom_target(${LAGER_TESTS_TARGET} COMMENT "Build all the unit tests.")
+add_dependencies(${LAGER_CHECK_TARGET} ${LAGER_TESTS_TARGET})
 
 file(GLOB lager_unit_tests "*.cpp" "cereal/*.cpp" "event_loop/*.cpp" "extra/*.cpp" "detail/*.cpp")
 
@@ -61,10 +61,10 @@ foreach(_file IN LISTS lager_unit_tests)
   endif()
   add_executable(${_target} EXCLUDE_FROM_ALL "${_file}")
   set_target_properties(${_target} PROPERTIES OUTPUT_NAME ${_output})
-  add_dependencies(tests ${_target})
+  add_dependencies(${LAGER_TESTS_TARGET} ${_target})
   target_compile_definitions(${_target} PUBLIC CATCH_CONFIG_MAIN)
   target_link_libraries(${_target} PUBLIC lager-dev Catch2::Catch2 ${_qt_libs})
-  add_test("test/${_output}" ${_output})
+  add_test("${LAGER_CTEST_PREFIX}test/${_output}" ${_output})
 endforeach()
 
 

@@ -5,6 +5,19 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 project(lager VERSION 0.1.0)
 
+# CMake target names are global across sibling projects in a superbuild.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(LAGER_CHECK_TARGET check)
+  set(LAGER_TESTS_TARGET tests)
+  set(LAGER_EXAMPLES_TARGET examples)
+  set(LAGER_CTEST_PREFIX "")
+else()
+  set(LAGER_CHECK_TARGET lager-check)
+  set(LAGER_TESTS_TARGET lager-tests)
+  set(LAGER_EXAMPLES_TARGET lager-examples)
+  set(LAGER_CTEST_PREFIX "lager/")
+endif()
+
 if(MSVC)
   set(CMAKE_CXX_STANDARD 20)
   add_compile_options(/Wall /Zc:preprocessor /bigobj)
@@ -278,7 +291,7 @@ if(lager_BUILD_TESTS)
   endif()
 
   enable_testing()
-  add_custom_target(check
+  add_custom_target(${LAGER_CHECK_TARGET}
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "Build and run all the tests and examples.")
