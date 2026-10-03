@@ -284,6 +284,7 @@ public:
         std::size_t slot;
         std::uint64_t sequence;
         std::uint64_t base_generation;
+        std::uint64_t allocation_generation;
     };
 
     class snapshot
@@ -382,8 +383,13 @@ public:
             slot.base = current_;
             slot.candidate = {};
             slot.base_generation = current_generation_;
+            slot.allocation_generation =
+                extents_.advance_allocation_generation();
             slot.active = true;
-            return {i, slot.sequence, current_generation_};
+            return {i,
+                    slot.sequence,
+                    current_generation_,
+                    slot.allocation_generation};
         }
         throw std::length_error{"controlled arena transaction table is full"};
     }
@@ -424,6 +430,8 @@ public:
                 collector.add_root(slot.base);
                 if (slot.candidate)
                     collector.add_root(slot.candidate);
+                collector.add_protected_generation(
+                    slot.allocation_generation);
             }
         if (after_root_capture)
             after_root_capture();
@@ -470,6 +478,7 @@ private:
         std::uint64_t sequence = 0;
         bool active = false;
         std::uint64_t base_generation = 0;
+        std::uint64_t allocation_generation = 0;
         root_handle base{};
         root_handle candidate{};
     };
@@ -1612,6 +1621,23 @@ void persistent_snapshot_graft(const std::string& path)
 
 void controlled_arena_reclamation()
 {
+    lager::arena_slot_bitmap generation_bitmap{4};
+    const auto abandoned_before_collection = generation_bitmap.allocate();
+    require(abandoned_before_collection.has_value(),
+            "generation arena failed its initial allocation");
+    generation_bitmap.begin_mark();
+    const auto allocated_during_collection = generation_bitmap.allocate();
+    require(allocated_during_collection.has_value(),
+            "generation arena failed its concurrent allocation");
+    (void) generation_bitmap.sweep();
+    require(!generation_bitmap.is_allocated(*abandoned_before_collection) &&
+                generation_bitmap.is_allocated(*allocated_during_collection),
+            "collection reclaimed a post-capture generation allocation");
+    generation_bitmap.begin_mark();
+    (void) generation_bitmap.sweep();
+    require(!generation_bitmap.is_allocated(*allocated_during_collection),
+            "unrooted post-capture allocation survived the next generation");
+
     constexpr std::uint32_t local_extent_id = 91;
     constexpr std::size_t local_slot_size = 1024;
     constexpr std::size_t local_slot_alignment = 16;
@@ -1669,6 +1695,7 @@ void controlled_arena_reclamation()
 
     auto initial = make_root(4096, 0);
     auto protocol = std::make_shared<controlled_gc_protocol>(extents, initial);
+    const auto orphan = make_root(4096, 20000);
     const auto transaction = protocol->begin_transaction();
     immer::storage_ptr<root_state> candidate;
     {
@@ -1677,9 +1704,6 @@ void controlled_arena_reclamation()
         candidate = immer::make_storage<root_state>(
             root_state{std::move(changed)});
     }
-    protocol->set_candidate(transaction, candidate);
-    const auto orphan = make_root(4096, 20000);
-
     traced_nodes old_nodes;
     initial->values.trace_children(old_nodes);
     traced_nodes candidate_nodes;
@@ -1737,6 +1761,9 @@ void controlled_arena_reclamation()
             "controlled collection did not reclaim unreachable slots");
     require(!extents.is_allocated(orphan.template rebind<void>()),
             "controlled collection retained an unreachable root slot");
+    require(extents.is_allocated(candidate.template rebind<void>()),
+            "GC reclaimed an unregistered candidate allocation generation");
+    protocol->set_candidate(transaction, candidate);
 
     deterministic_gate publication_capture_gate;
     std::size_t second_reclaimed = 0;

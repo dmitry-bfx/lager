@@ -76,11 +76,14 @@ and graph reachability, not reuse safety.
 `persistent-round-trip-controlled-gc` uses an in-memory, single-process arena
 with reclamation enabled. Barriers force a reader to attempt acquisition during
 root capture and a writer to publish a pre-capture candidate afterward. The
-test keeps an old reader through a graft and a collection, releases and reuses
-its pin slot, verifies that a stale release cannot clear the new pin, then
-proves that unreachable slots are reclaimed and one is allocated again. This
-validates the first controlled arena only; it does not validate the mapped
-multiprocess protocol.
+active transaction's allocation generation protects its candidate while it is
+not yet registered as a root. A separate bitmap check confirms allocations
+made during marking survive that sweep and become reclaimable in the next
+generation. The test keeps an old reader through a graft and a collection,
+releases and reuses its pin slot, verifies that a stale release cannot clear
+the new pin, then proves that unreachable slots are reclaimed and one is
+allocated again. This validates the first controlled arena only; it does not
+validate the mapped multiprocess protocol.
 
 The staged synchronization design and the multiprocess protocol still required
 before mapped reclamation are described in

@@ -38,7 +38,8 @@ public:
                                std::size_t used_prefix = 0)
         : slot_count_{slot_count},
           allocated_((slot_count + word_bits - 1) / word_bits),
-          marked_((slot_count + word_bits - 1) / word_bits)
+          marked_((slot_count + word_bits - 1) / word_bits),
+          allocation_generations_(slot_count)
     {
         if (used_prefix > slot_count_)
             throw std::invalid_argument{"arena used prefix exceeds its size"};
@@ -57,6 +58,7 @@ public:
             const auto bit = static_cast<std::size_t>(std::countr_zero(available));
             const auto slot = word * word_bits + bit;
             set(allocated_, slot);
+            allocation_generations_[slot] = current_generation_;
             if (collecting_)
                 set(marked_, slot);
             return slot;
@@ -70,6 +72,8 @@ public:
         require_slot(slot);
         const auto fresh = !test(allocated_, slot);
         set(allocated_, slot);
+        if (fresh)
+            allocation_generations_[slot] = current_generation_;
         if (collecting_)
             set(marked_, slot);
         return fresh;
@@ -81,7 +85,10 @@ public:
         if (first > last || last > slot_count_)
             throw std::out_of_range{"arena reservation range is invalid"};
         for (auto slot = first; slot < last; ++slot) {
+            const auto fresh = !test(allocated_, slot);
             set(allocated_, slot);
+            if (fresh)
+                allocation_generations_[slot] = current_generation_;
             if (collecting_)
                 set(marked_, slot);
         }
@@ -92,8 +99,33 @@ public:
         std::lock_guard<std::mutex> lock{mutex_};
         if (collecting_)
             throw std::logic_error{"arena collection is already active"};
+        if (current_generation_ == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error{"arena allocation generation exhausted"};
         std::fill(marked_.begin(), marked_.end(), 0);
+        frozen_generation_ = current_generation_;
+        ++current_generation_;
         collecting_ = true;
+    }
+
+    //! Start an allocation generation for a registered writer transaction.
+    std::uint64_t advance_allocation_generation()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (current_generation_ == std::numeric_limits<std::uint64_t>::max())
+            throw std::overflow_error{"arena allocation generation exhausted"};
+        return ++current_generation_;
+    }
+
+    //! Protect all allocations owned by a live transaction generation.
+    void mark_generation(std::uint64_t generation)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (!collecting_)
+            throw std::logic_error{"arena marking has not begun"};
+        for (std::size_t slot = 0; slot < slot_count_; ++slot)
+            if (test(allocated_, slot) &&
+                allocation_generations_[slot] == generation)
+                set(marked_, slot);
     }
 
     //! Returns true only the first time this allocated slot is marked.
@@ -124,9 +156,20 @@ public:
             throw std::logic_error{"arena marking has not begun"};
         std::size_t reclaimed = 0;
         for (std::size_t word = 0; word < allocated_.size(); ++word) {
-            const auto dead = allocated_[word] & ~marked_[word];
-            reclaimed += static_cast<std::size_t>(std::popcount(dead));
-            allocated_[word] &= marked_[word];
+            auto slots = allocated_[word];
+            while (slots != 0) {
+                const auto bit = static_cast<std::size_t>(
+                    std::countr_zero(slots));
+                const auto slot = word * word_bits + bit;
+                const auto mask = std::uint64_t{1} << bit;
+                if (allocation_generations_[slot] <= frozen_generation_ &&
+                    !test(marked_, slot)) {
+                    allocated_[word] &= ~mask;
+                    allocation_generations_[slot] = 0;
+                    ++reclaimed;
+                }
+                slots &= slots - 1;
+            }
         }
         collecting_ = false;
         std::fill(marked_.begin(), marked_.end(), 0);
@@ -170,7 +213,10 @@ private:
     std::size_t slot_count_;
     std::vector<std::uint64_t> allocated_;
     std::vector<std::uint64_t> marked_;
+    std::vector<std::uint64_t> allocation_generations_;
     mutable std::mutex mutex_;
+    std::uint64_t current_generation_ = 0;
+    std::uint64_t frozen_generation_ = 0;
     bool collecting_ = false;
 };
 
@@ -413,6 +459,38 @@ public:
                 bitmap->cancel_mark();
             throw;
         }
+    }
+
+    //! Advance every distinct arena to one writer allocation generation.
+    std::uint64_t advance_allocation_generation() const
+    {
+        require_table();
+        std::vector<std::shared_ptr<arena_slot_bitmap>> advanced;
+        std::optional<std::uint64_t> generation;
+        for (const auto& extent : *table_) {
+            if (!extent.slot_bitmap ||
+                std::find(advanced.begin(), advanced.end(), extent.slot_bitmap) !=
+                    advanced.end())
+                continue;
+            const auto next = extent.slot_bitmap->advance_allocation_generation();
+            if (generation && *generation != next)
+                throw std::logic_error{
+                    "arena allocation generations are out of sync"};
+            generation = next;
+            advanced.push_back(extent.slot_bitmap);
+        }
+        if (!generation)
+            throw std::logic_error{"storage snapshot has no allocation arenas"};
+        return *generation;
+    }
+
+    //! Retain all slots allocated by one active transaction generation.
+    void mark_generation(std::uint64_t generation) const
+    {
+        require_table();
+        for (const auto& extent : *table_)
+            if (extent.slot_bitmap)
+                extent.slot_bitmap->mark_generation(generation);
     }
 
     bool mark(immer::storage_ptr<void> handle) const

@@ -15,12 +15,12 @@ traversal after snapshot acquisition takes no coordinator lock. Holding the
 coordinator during a local collection is acceptable for this first stage; it
 does not meet the final reader or writer latency targets.
 
-The controlled integration harness tests completed candidates registered
-before root capture and blocks root changes while capture and sweep run. The
-production bitmap marks allocations made while a mark is active, but has no
-per-slot allocation-generation metadata. Therefore the generation protocol
-below is required work, not a claim about current production behavior. The
-harness does not test a candidate allocation racing its first registration.
+The controlled integration harness assigns slots to allocation generations,
+advances the arena generation at collection start, and retains allocations
+owned by active transaction generations. It blocks root changes while capture
+and sweep run. It tests a completed candidate that is not yet registered as a
+root during collection. It does not test allocation racing the transaction's
+initial registration or a transaction that allocates in several generations.
 
 ### Snapshot acquisition and release
 
@@ -60,12 +60,14 @@ immutable node loads.
 For the complete local protocol, at GC start while holding the coordinator and
 allocator mutex, the collector freezes generation `G` and advances the
 allocator to `G+1`. Slots allocated in `G+1` or later are excluded from this
-sweep. Pre-GC candidate slots belonging to a still-live transaction are
-retained, even when the candidate has not yet been published. Once the writer
-publishes, the new current root protects the candidate on future collections.
-Failed candidates become reclaimable after their transaction record is
-removed. Per-slot generation tracking and active-generation exclusion are not
-implemented yet.
+sweep and become eligible at the next collection. Pre-GC candidate slots
+belonging to a still-live transaction are retained, even when the candidate
+has not yet been published. Once the writer publishes, the new current root
+protects the candidate on future collections. Failed candidates become
+reclaimable after their transaction record is removed. The local bitmap
+implements per-slot generations and excludes post-capture generations from the
+current sweep. The mapped generation metadata and process-shared transaction
+generation protocol remain unimplemented.
 
 ### Root capture, grafts, and sweep
 

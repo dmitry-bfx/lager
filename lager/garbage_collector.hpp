@@ -186,6 +186,12 @@ public:
         });
     }
 
+    //! Preserve allocations owned by a writer that has not published a root.
+    void add_protected_generation(std::uint64_t generation)
+    {
+        protected_generations_.push_back(generation);
+    }
+
     //! Pin a persistent snapshot until this collector has finished tracing.
     template <typename T,
               std::enable_if_t<gc_detail::is_typed_storage_ptr<T>::value,
@@ -265,6 +271,8 @@ public:
         try {
             extents_.begin_mark();
             marking = true;
+            for (const auto generation : protected_generations_)
+                extents_.mark_generation(generation);
             auto storage_scope = extents_.activate();
             auto visitor = storage_mark_visitor{extents_};
             for (auto& trace_root : roots_)
@@ -280,6 +288,7 @@ public:
 private:
     extent_snapshot extents_;
     std::vector<std::function<void(storage_mark_visitor&)>> roots_;
+    std::vector<std::uint64_t> protected_generations_;
 };
 
 } // namespace lager
