@@ -72,3 +72,20 @@ needs space. Mapped extents still set `can_reclaim_slots` to false, so
 collection does not make slots reusable. Allocation-generation coordination,
 concurrent multiprocess marking/sweeping, and reader-safe slot reuse remain
 unfinished.
+
+## Remaining spec gaps confirmed by this run
+
+The persistent round-trip and transaction tests pass, but the current
+generation counters do not yet implement one global sequence across every
+shared domain. A persistent root journal sequences the stores recorded in that
+journal, a shared-ephemeral arena has its own sequence, and independent
+journals have independent sequences. Exact dependency validation is tested
+within one journal or one shared-ephemeral arena; cross-kind dependencies and
+ordering between those generation namespaces are not established.
+
+Snapshot reads use atomic root/cache loads and do not take the writer commit
+lock. Acquiring a process-shared snapshot pin currently allocates a lease and
+consumes one of the bounded shared pin slots. That does not meet the spec's
+stricter audio-thread target of allocation-free snapshot acquisition. A
+lock-free, allocation-free reader registration protocol is still needed before
+claiming that requirement.
