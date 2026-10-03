@@ -97,8 +97,8 @@ substore<immer::storage_ptr<void>, shared_persistent_policy>
 restore_persistent_substore(shared_store_runtime& runtime,
                             const durable_root_descriptor& descriptor,
                             const T& layout_sample,
-                            std::uint32_t schema_version = 1,
-                            persistent_root_journal* journal = nullptr)
+                            persistent_root_journal& journal,
+                            std::uint32_t schema_version = 1)
 {
     const auto layout = persistent_layout(layout_sample, schema_version);
     if (!descriptor.root)
@@ -110,21 +110,6 @@ restore_persistent_substore(shared_store_runtime& runtime,
     (void) typed_root.get();
     return runtime.restore_persistent_root(
         descriptor, layout.fingerprint, journal);
-}
-
-template <typename T>
-substore<immer::storage_ptr<void>, shared_persistent_policy>
-restore_persistent_substore(shared_store_runtime& runtime,
-                            const durable_root_descriptor& descriptor,
-                            const T& layout_sample,
-                            persistent_root_journal& journal,
-                            std::uint32_t schema_version = 1)
-{
-    return restore_persistent_substore(runtime,
-                                       descriptor,
-                                       layout_sample,
-                                       schema_version,
-                                       &journal);
 }
 
 } // namespace lager

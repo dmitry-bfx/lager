@@ -231,7 +231,8 @@ if (lager_BUILD_PERSISTENT_ROUND_TRIP)
     add_test(NAME persistent-round-trip-cross-process-dependency
       COMMAND lager-persistent-round-trip cross-dependency
         "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-cross-dependency.store")
-    foreach(_stage allocation data-flush root-record-write publication)
+    foreach(_stage allocation data-flush root-record-write root-record-commit
+                   publication)
       add_test(NAME persistent-round-trip-crash-${_stage}
         COMMAND lager-persistent-round-trip crash
           "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-crash-${_stage}.store"

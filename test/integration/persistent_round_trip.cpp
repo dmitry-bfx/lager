@@ -327,6 +327,10 @@ void update_store(const std::string& path)
                           std::back_inserter(shared_nodes));
     require(!shared_nodes.empty(),
             "persistent vector update did not preserve shared nodes");
+    lager::tracing_collector collector{updated_snapshot.extents()};
+    collector.add_persistent_roots<root_state>(journal, layout.fingerprint);
+    require(collector.collect() == 0,
+            "mapped extents reclaimed slots without a reader-safe sweep");
     std::cout << "updated generation " << new_generation << "; "
               << shared_nodes.size()
               << " Immer nodes remain structurally shared\n";
@@ -514,7 +518,8 @@ void crash_update_child(const std::string& path, const std::string& stage)
         ::kill(::getpid(), SIGKILL);
         ::_exit(137);
     }
-    if (stage == "root-record-write" || stage == "publication")
+    if (stage == "root-record-write" || stage == "root-record-commit" ||
+        stage == "publication")
         ::setenv("LAGER_PERSISTENT_FAILPOINT", stage.c_str(), 1);
     const auto layout = lager::persistent_layout(layout_sample, 1);
     (void) lager::update_persistent_root<root_state>(
@@ -529,9 +534,27 @@ void crash_update_child(const std::string& path, const std::string& stage)
     ::_exit(0);
 }
 
+const lager::durable_root_descriptor& root_for(
+    const std::vector<lager::durable_root_descriptor>& roots,
+    std::uint64_t id);
+
 void crash_case(const std::string& path, const std::string& stage)
 {
     create_store(path);
+    auto file = lager::persistent_storage_file::open(path);
+    lager::shared_store_runtime runtime;
+    auto mappings = file.map_existing_extents();
+    for (const auto& mapping : mappings)
+        runtime.publish_extent(mapping.view());
+    auto storage = runtime.activate_storage();
+    auto journal = file.roots();
+    const auto roots = journal.recover();
+    const root_state layout_sample{};
+    auto store = lager::restore_persistent_substore(
+        runtime, root_for(roots, store_id), layout_sample, journal);
+    const auto old_snapshot = runtime.read(store);
+    const auto layout = lager::persistent_layout(layout_sample, 1);
+
     const auto child = ::fork();
     require(child >= 0, "fork failed for crash-boundary test");
     if (child == 0)
@@ -542,26 +565,11 @@ void crash_case(const std::string& path, const std::string& stage)
     require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
             "crash writer did not terminate at requested boundary");
 
-    auto file = lager::persistent_storage_file::open(path);
-    lager::shared_store_runtime runtime;
-    auto mappings = file.map_existing_extents();
-    for (const auto& mapping : mappings)
-        runtime.publish_extent(mapping.view());
-    auto journal = file.roots();
-    const auto roots = journal.recover();
-    const auto found = std::find_if(roots.begin(),
-                                    roots.end(),
-                                    [](const auto& root) {
-                                        return root.store_id == store_id;
-                                    });
-    require(found != roots.end(), "recovery lost every committed root");
-    auto storage = runtime.activate_storage();
-    const root_state layout_sample{};
-    auto store = lager::restore_persistent_substore(
-        runtime, *found, layout_sample, journal);
+    // Reuse the already-attached runtime: this exercises repair of the mapped
+    // publication cache after a writer dies between the log marker and cache.
     const auto snapshot = runtime.read(store);
-    const auto layout = lager::persistent_layout(layout_sample, 1);
-    const bool committed = stage == "publication";
+    const bool committed = stage == "root-record-commit" ||
+                           stage == "publication";
     snapshot.with_root<root_state>(layout.fingerprint, [&](const auto& root) {
         require(root.values.size() == value_count,
                 "crash recovery exposed an incomplete vector");
@@ -570,6 +578,25 @@ void crash_case(const std::string& path, const std::string& stage)
                                : static_cast<int>(changed_index)),
                 "crash recovery did not select an atomic root version");
     });
+    const auto repaired_roots = journal.recover();
+    const auto& repaired_root = root_for(repaired_roots, store_id);
+    const auto repaired_snapshot = runtime.read(store);
+    require(repaired_snapshot.generation() == repaired_root.generation,
+            "attached runtime did not adopt the repaired root cache");
+    repaired_snapshot.with_root<root_state>(layout.fingerprint,
+        [&](const auto& root) {
+            require(root.values[changed_index] ==
+                        (committed ? changed_value
+                                   : static_cast<int>(changed_index)),
+                    "journal repair selected an incorrect root");
+        });
+    old_snapshot.with_root<root_state>(
+        layout.fingerprint,
+        [&](const auto& root) {
+            require(root.values[changed_index] ==
+                        static_cast<int>(changed_index),
+                    "crash recovery changed an old pinned snapshot");
+        });
     std::cout << "termination at " << stage << " recovered the "
               << (committed ? "new" : "previous") << " complete root\n";
 }
@@ -854,7 +881,6 @@ void cross_process_dependency(const std::string& path)
     char ready = 0;
     require(::read(ready_pipe[0], &ready, 1) == 1,
             "cross-domain transaction did not prepare its candidate");
-
     auto file = lager::persistent_storage_file::open(path);
     lager::shared_store_runtime runtime;
     auto mappings = file.map_existing_extents();
@@ -862,6 +888,18 @@ void cross_process_dependency(const std::string& path)
         runtime.publish_extent(mapping.view());
     auto journal = file.roots();
     const auto roots = journal.recover();
+    const auto& initial_dependency = root_for(roots,
+                                              dependency_store_id);
+    auto child_pins = journal.pinned_roots();
+    require(std::any_of(child_pins.begin(),
+                        child_pins.end(),
+                        [&](const auto& pin) {
+                            return pin.store_id == dependency_store_id &&
+                                   pin.generation ==
+                                       initial_dependency.generation &&
+                                   pin.root == initial_dependency.root;
+                        }),
+            "another process's transaction read was absent from GC roots");
     auto storage = runtime.activate_storage();
     const root_state layout_sample{};
     auto dependency = lager::restore_persistent_substore(
@@ -870,25 +908,43 @@ void cross_process_dependency(const std::string& path)
         layout_sample,
         journal);
     const auto before_remote_commit = runtime.read(dependency).generation();
-    auto transaction = runtime.begin_transaction(dependency);
-    (void) lager::update_persistent_root<root_state>(
-        transaction,
-        layout_sample,
-        [](const root_state& old_root) {
-            auto updated = old_root;
-            updated.values = updated.values.set(0, 8675311);
-            return updated;
-        },
-        journal);
+    {
+        auto transaction = runtime.begin_transaction(dependency);
+        (void) lager::update_persistent_root<root_state>(
+            transaction,
+            layout_sample,
+            [](const root_state& old_root) {
+                auto updated = old_root;
+                updated.values = updated.values.set(0, 8675311);
+                return updated;
+            },
+            journal);
+    }
     const auto remotely_updated = runtime.read(dependency);
     require(remotely_updated.generation() > before_remote_commit,
             "persistent read did not acquire the other process root");
     remotely_updated.with_root<root_state>(
         lager::persistent_layout(layout_sample, 1).fingerprint,
         [](const auto& root) {
-            require(root.values[0] == 8675311,
+    require(root.values[0] == 8675311,
                     "persistent read saw a stale process-local root");
         });
+    child_pins = journal.pinned_roots();
+    require(std::any_of(child_pins.begin(),
+                        child_pins.end(),
+                        [&](const auto& pin) {
+                            return pin.store_id == dependency_store_id &&
+                                   pin.generation ==
+                                       initial_dependency.generation &&
+                                   pin.root == initial_dependency.root;
+                        }),
+            "committing a new root hid an old process-pinned dependency");
+    lager::tracing_collector collector{remotely_updated.extents()};
+    collector.add_persistent_roots<root_state>(
+        journal,
+        lager::persistent_layout(layout_sample, 1).fingerprint);
+    require(collector.collect() == 0,
+            "collector reclaimed slots while another process pinned an old root");
     const char release = 'g';
     require(::write(release_pipe[1], &release, 1) == 1,
             "could not release cross-domain transaction");
@@ -897,6 +953,16 @@ void cross_process_dependency(const std::string& path)
             "waitpid failed for cross-domain transaction");
     require(WIFEXITED(status) && WEXITSTATUS(status) == 2,
             "cross-process exact dependency did not reject stale commit");
+    child_pins = journal.pinned_roots();
+    require(std::none_of(child_pins.begin(),
+                         child_pins.end(),
+                         [&](const auto& pin) {
+                             return pin.store_id == dependency_store_id &&
+                                    pin.generation ==
+                                        initial_dependency.generation &&
+                                    pin.root == initial_dependency.root;
+                         }),
+            "dead reader process left its root pin registered");
     ::close(ready_pipe[0]);
     ::close(release_pipe[1]);
 

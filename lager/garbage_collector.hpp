@@ -219,6 +219,27 @@ public:
         add_root(root.template rebind<T>());
     }
 
+    //! Add durable current roots and process-shared reader/transaction pins
+    //! matching one reflected root type. Call once for each persistent root
+    //! layout represented in the journal.
+    template <typename RootT>
+    void add_persistent_roots(const persistent_root_journal& journal,
+                              std::uint64_t expected_layout_id)
+    {
+        static_assert(!std::is_void<RootT>::value,
+                      "persistent GC roots need a concrete reflected type");
+        if (expected_layout_id == 0)
+            throw std::invalid_argument{
+                "persistent GC layout ID must be nonzero"};
+        const auto add = [&](const durable_root_descriptor& root) {
+            if (root.layout_id != expected_layout_id)
+                return;
+            add_root_as<RootT>(root.root);
+        };
+        for (const auto& root : journal.roots_for_gc())
+            add(root);
+    }
+
     std::size_t collect()
     {
         bool marking = false;

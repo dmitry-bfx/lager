@@ -273,12 +273,16 @@ public:
 private:
     friend class shared_store_runtime;
     explicit shared_snapshot(std::shared_ptr<const descriptor_type> descriptor,
-                             extent_snapshot extents)
-        : descriptor_{std::move(descriptor)}, extents_{std::move(extents)}
+                             extent_snapshot extents,
+                             std::shared_ptr<void> root_pin = {})
+        : descriptor_{std::move(descriptor)},
+          extents_{std::move(extents)},
+          root_pin_{std::move(root_pin)}
     {}
 
     std::shared_ptr<const descriptor_type> descriptor_;
     extent_snapshot extents_;
+    std::shared_ptr<void> root_pin_;
 };
 
 //! Thrown when a transaction's write snapshot is no longer the current root.
@@ -490,7 +494,7 @@ public:
     substore<immer::storage_ptr<void>, shared_persistent_policy>
     restore_persistent_root(const durable_root_descriptor& descriptor,
                             std::uint64_t expected_layout_id,
-                            persistent_root_journal* journal = nullptr)
+                            persistent_root_journal& journal)
     {
         if (descriptor.store_id == 0 || !descriptor.root ||
             descriptor.root.extent_id() == 0 || expected_layout_id == 0 ||
@@ -512,9 +516,8 @@ public:
                 descriptor.generation,
                 descriptor.read_watermark,
                 descriptor.layout_id);
-        if (journal)
-            value->persistent_root_channel =
-                std::make_shared<persistent_root_journal>(*journal);
+        value->persistent_root_channel =
+            std::make_shared<persistent_root_journal>(journal);
         {
             // Advance the process-wide generation floor before exposing this
             // recovered domain. Otherwise a concurrent create/commit could
@@ -658,6 +661,7 @@ public:
     shared_snapshot<T> read(substore<T, Policy> store) const
     {
         auto selected = find_domain<T, Policy>(store.id());
+        std::shared_ptr<void> persistent_pin;
         if constexpr (std::is_same_v<T, immer::storage_ptr<void>> &&
                       std::is_same_v<Policy, shared_ephemeral_policy>) {
             if (selected->shared_root_channel) {
@@ -675,9 +679,9 @@ public:
         if constexpr (std::is_same_v<T, immer::storage_ptr<void>> &&
                       std::is_same_v<Policy, shared_persistent_policy>) {
             if (selected->persistent_root_channel) {
-                const auto latest =
-                    selected->persistent_root_channel->read_root(
-                        store.id().value);
+                auto pinned = selected->persistent_root_channel->pin_current_root(
+                    store.id().value);
+                const auto latest = pinned.descriptor;
                 if (latest.layout_id !=
                     std::atomic_load_explicit(&selected->current,
                                               std::memory_order_acquire)
@@ -686,12 +690,14 @@ public:
                         "durable root layout changed in another process"};
                 (void) extents_.pin().resolve(latest.root);
                 adopt_persistent_root(selected, latest);
+                persistent_pin = std::move(pinned.lifetime);
             }
         }
         return shared_snapshot<T>{
             std::atomic_load_explicit(&selected->current,
                                       std::memory_order_acquire),
-            extents_.pin()};
+            extents_.pin(),
+            std::move(persistent_pin)};
     }
 
     //! Resolve a shared substore selected from an ordinary Lager reader or
@@ -810,6 +816,13 @@ public:
         if (base.layout_id() != layout_id)
             throw std::invalid_argument{
                 "persistent transaction layout does not match its root"};
+
+        // Keep a speculative root visible to tracing collectors throughout
+        // flush and publication. Slot reclamation stays disabled until the
+        // runtime closes the allocation-to-pin race with a GC handshake.
+        auto candidate_pin = journal.pin_root_handle(
+            store.id().value, base.generation(), candidate, layout_id);
+        (void) candidate_pin;
 
         const auto extents = extents_.pin();
         if (!extents.is_durable(candidate))

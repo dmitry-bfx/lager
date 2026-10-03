@@ -27,9 +27,11 @@ The writer, reader, updater, and final reader are separate process invocations.
 The reader reserves the writer's old mapping address before opening the extent,
 then validates the reflected layout and indexes every saved vector value. The
 crash tests terminate writers after speculative allocation, after data flush,
-after the root-record body write, and after the publication marker is durable.
-The expected recovery is the previous root for the first three boundaries and
-the new root after publication.
+after the root-record body write, after the durable commit marker but before
+cache publication, and after cache publication. An already-attached reader
+sees the committed pending descriptor without waiting on the writer, and
+journal recovery then reconciles its cache. The expected root is previous
+before the commit marker and new at or after it.
 
 On POSIX, the shared-ephemeral check also attaches a second process to one named
 arena, observes its root update through the mapped atomic root table, rejects a
@@ -37,23 +39,32 @@ stale writer, and rejects a writer whose exact cross-substore dependency
 changed.
 
 Persistent root journals also contain a fixed 32-store mapped atomic root
-cache. Attached runtimes use it for lock-free interprocess root reads; the
-append-only journal remains the durable source of truth and repairs cache state
-when a process opens the journal after an interrupted publication.
+cache and a 24-slot process-shared reader/candidate pin table. Attached
+runtimes use the cache for interprocess root reads; each persistent snapshot
+and in-flight commit publishes its root in the pin table. The append-only
+journal remains the durable source of truth and repairs cache state when a
+process opens the journal after an interrupted publication. Attached root
+reads remain lock-free during publication by selecting the pending descriptor
+after the durable marker; explicit recovery reconciles the mapped cache. A
+collector can
+enumerate current roots and live pins with `add_persistent_roots`, once for
+each reflected root layout used by the journal.
 
 ## Reader and GC boundary
 
-The integration test holds the transaction's old snapshot across an update and
-checks that the new vector still shares Immer nodes with it. This confirms
-structural sharing while both snapshots are alive; it does not validate
-reclamation safety.
+The integration test holds a transaction's old snapshot across an update and
+checks that the new vector still shares Immer nodes with it. A second process
+holds an old cross-domain dependency snapshot while the parent commits a newer
+root; the parent observes the old handle in the shared pin table and sees the
+pin cleared after that process exits and is reaped. This validates pin
+publication and dead-process cleanup, but does not validate reclamation safety.
 
-The durable root journal and mapped node bytes are process-shared. Runtime
-domain descriptors, `shared_ptr` snapshot pins, extent-directory snapshots,
-and slot bitmaps are process-local. The current collector requires callers to
-list roots explicitly; it does not discover each runtime's current roots,
-transaction candidates, or snapshots in other processes. Mapped extents set
-`can_reclaim_slots` to false, so collection does not make slots reusable. There
-are no cross-process reader slots or epoch protocol yet, and no collector runs
-concurrently with the integration readers. Concurrent multiprocess GC and
-reader-safe slot reuse remain unsupported.
+The durable root journal, mapped node bytes, and reader/candidate pin descriptors
+are process-shared. Runtime domain descriptors, extent-directory snapshots,
+and slot bitmaps are process-local. The pin table is bounded at 16 simultaneous
+pins per journal; pins from processes that have exited and been reaped are
+cleared when roots are enumerated or a new pin needs space. Mapped extents
+still set `can_reclaim_slots` to false, so
+collection does not make slots reusable. Allocation-generation coordination,
+concurrent multiprocess marking/sweeping, and reader-safe slot reuse remain
+unfinished.
