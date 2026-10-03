@@ -1930,6 +1930,10 @@ void controlled_arena_reclamation()
     (void) protocol->collect();
     require(extents.is_allocated(candidate.template rebind<void>()),
             "GC reclaimed a subtree still pinned by a reader");
+    for (const auto node : grafted_nodes)
+        require(extents.is_allocated(
+                    immer::storage_ptr<void>::from_bits(node)),
+                "GC reclaimed a node shared from the pinned old subtree");
     require(current_reader.root()->values[0] == -1,
             "GC reclaimed a grafted node reachable from the pinned root");
 

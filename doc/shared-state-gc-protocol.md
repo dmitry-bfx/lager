@@ -1,30 +1,38 @@
 # Shared storage GC protocol
 
-This document separates the protocol needed to safely reuse slots in one
-controlled arena from the later process-shared protocol. The current mapped
+This document separates the correctness harness for safely reusing slots in
+one controlled arena from the later process-shared protocol. The controlled
+protocol is implemented only by the integration-test harness plus the
+`arena_slot_bitmap`; it is not the shared-store runtime protocol. The mapped
 persistent and shared-ephemeral backends keep `can_reclaim_slots` disabled.
 They do not implement the process-shared protocol below.
 
 ## Controlled arena protocol
 
-The first implementation uses one in-process arena coordinator and one arena
-allocator mutex. It is a correctness harness, not the final reader protocol.
-The coordinator mutex serializes snapshot acquisition, pin-slot updates,
-transaction registration, root publication, and root capture. Immutable
-traversal after snapshot acquisition takes no coordinator lock. Holding the
-coordinator during a local collection is acceptable for this first stage; it
-does not meet the final reader or writer latency targets.
+The harness uses one in-process arena coordinator and an arena allocator
+mutex. This is a correctness harness, not the runtime's reader protocol. The
+coordinator mutex serializes snapshot acquisition, pin-slot updates,
+transaction registration, root publication, and root capture through sweep.
+The bitmap mutex serializes allocation, generation changes, marking, and
+sweeping. Immutable traversal after snapshot acquisition takes no coordinator
+lock. Holding the coordinator during local collection is acceptable for this
+stage; it does not meet the final reader or writer latency targets.
 
 The controlled integration harness assigns slots to allocation generations,
 advances the arena generation at collection start, and retains allocations
 owned by active transaction generations. It blocks root changes while capture
-and sweep run. It tests a completed candidate that is not yet registered as a
-root during collection. It does not test allocation racing the transaction's
-initial registration or a transaction that allocates in several generations.
+and sweep run. It tests candidate allocation before collection and publication
+after root capture. It does not test allocation racing the transaction's
+initial registration, transactions allocating in several generations,
+multiple concurrently allocating transaction generations, or concurrent
+collector instances. In particular, the bitmap has one current allocation
+generation: interleaved allocations from two live transactions are not yet
+tagged by transaction ownership and are outside this harness's proof.
 
 ### Snapshot acquisition and release
 
-1. Lock the coordinator.
+1. Lock the coordinator. This is the acquisition synchronization point with
+   both root capture and pin release/reuse.
 2. Load the current root descriptor.
 3. Claim a free pin slot, increment its slot sequence, write the root handle and
    generation, then publish the slot as active.
@@ -41,9 +49,9 @@ immutable node loads.
 
 ### Writer transactions and allocation generations
 
-1. A transaction registers its base root and every shared read dependency
-   before constructing a candidate. Those roots remain registered through
-   commit or abort.
+1. Under the coordinator, a transaction registers its base root and every
+   shared read dependency before constructing a candidate. Those roots remain
+   registered through commit or abort.
 2. Arena allocation tags each reserved slot with the current allocation
    generation. A reserved slot is not exposed through a root until its object
    construction completes.
@@ -57,14 +65,15 @@ immutable node loads.
    remains live until this publication finishes. Abort removes the record;
    its unreachable allocations are eligible at a later collection.
 
-For the complete local protocol, at GC start while holding the coordinator and
-allocator mutex, the collector freezes generation `G` and advances the
-allocator to `G+1`. Slots allocated in `G+1` or later are excluded from this
-sweep and become eligible at the next collection. Pre-GC candidate slots
-belonging to a still-live transaction are retained, even when the candidate
-has not yet been published. Once the writer publishes, the new current root
-protects the candidate on future collections. Failed candidates become
-reclaimable after their transaction record is removed. The local bitmap
+At collection start, while holding the coordinator and allocator mutex, the
+collector freezes generation `G` and advances the allocator to `G+1`. That is
+the allocation/capture synchronization point: every allocation is assigned to
+either `G` or a later generation. Slots allocated in `G+1` or later are
+excluded from this sweep and become eligible at a later collection. Pre-GC
+candidate slots belonging to a still-live transaction are retained, even when
+the candidate has not yet been published. Once the writer publishes, the new
+current root protects the candidate on future collections. Failed candidates
+become reclaimable after their transaction record is removed. The local bitmap
 implements per-slot generations and excludes post-capture generations from the
 current sweep. The mapped generation metadata and process-shared transaction
 generation protocol remain unimplemented.
@@ -77,9 +86,15 @@ and explicit persistent snapshots. The complete protocol starts marking
 before releasing the allocator mutex, then traces immutable nodes outside the
 coordinator. The sweep considers only allocated slots in generations at or
 below `G`; it frees an unmarked slot only when it is not owned by a live
-transaction generation. Freed slots re-enter the controlled arena's free
-bitmap and can be allocated again. The current harness instead holds the
-coordinator for the full mark and sweep, which is deliberately more serializing.
+transaction generation. Mark completion is the synchronization point before
+sweep; the bitmap mutex prevents allocation/mark/sweep metadata races. Freed
+slots re-enter the controlled arena's free bitmap and can be allocated again.
+The harness holds the coordinator for the full mark and sweep, which is
+deliberately more serializing. A slot is reclaimed only if it belongs to the
+frozen generation range, was not reached from any captured root, and is not
+protected by an active transaction generation. Thus every graph reachable
+from a current, pinned, explicit, or live-candidate root is marked, while
+unreachable old-generation allocations are reusable.
 
 A subtree copied from an old snapshot is safe only while its source snapshot
 or a transaction read dependency remains pinned until the graft candidate is
@@ -173,8 +188,9 @@ those tests pass.
   failpoint kills a reader after it claims a slot but before descriptor
   publication; the parent reaps it and successfully registers another pin.
   Persistent writer crash failpoints cover durable publication boundaries.
-  PID reuse and concurrent pin-slot reuse during collection remain unresolved.
-  No multiprocess reclamation claim is made.
+  Linux process-start tokens distinguish PID reuse; on systems without that
+  token, cleanup falls back to PID liveness and may conservatively retain a
+  stale pin. No multiprocess reclamation claim is made.
 
 Today, persistent root records, mapped pin descriptors, mapped node bytes, and
 the shared-ephemeral root/pin tables are process-shared. `shared_ptr` snapshot
@@ -191,10 +207,12 @@ disabled for mapped extents, so candidate slot reuse remains unsafe today.
 
 Existing crash failpoints exercise writer death at allocation, data flush,
 root-record body write, durable marker, and cache publication, plus reader death
-after pin-slot claim and before descriptor publication. The process-shared pin
-reaper identifies owners by PID without a PID-reuse-resistant process-start
-token. PID reuse and a reader/collector registration handshake remain open
-protocol cases, not covered by the local arena test.
+after pin-slot claim and before descriptor publication. On Linux, the
+process-shared pin reaper checks PID plus process start time; the fallback on
+other platforms is only PID liveness. Pin registration/enumeration has a
+sequence handshake, but that is not a shared allocation-generation or
+reader/collector reclamation handshake. Those remain open and are not covered
+by the local arena test.
 
 The coordinator lock in the controlled phase is intentionally not the final
 audio-thread protocol. Lock-free, allocation-free snapshot registration and
