@@ -380,6 +380,7 @@ public:
                         std::memory_order_seq_cst,
                         std::memory_order_relaxed))
                     continue;
+                test_failpoint("pin-registration");
                 slot.store_id.store(store_id, std::memory_order_relaxed);
                 slot.generation.store(generation, std::memory_order_relaxed);
                 slot.root_bits.store(root.bits(), std::memory_order_relaxed);

@@ -73,6 +73,12 @@ reader is still pinned and confirms both the reader and the new root retain the
 old value. Slot reclamation remains disabled, so this verifies root capture
 and graph reachability, not reuse safety.
 
+`persistent-round-trip-crash-pin-registration` kills a reader immediately after
+it claims a persistent pin slot and before it publishes the descriptor. Root
+enumeration reaps the dead claimant, after which another reader successfully
+uses the pin table. This checks dead-process cleanup, not concurrent mapped
+reclamation safety.
+
 `persistent-round-trip-controlled-gc` uses an in-memory, single-process arena
 with reclamation enabled. Barriers force a reader to attempt acquisition during
 root capture and a writer to publish a pre-capture candidate afterward. The

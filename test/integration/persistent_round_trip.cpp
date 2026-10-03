@@ -1068,6 +1068,52 @@ void crash_case(const std::string& path, const std::string& stage)
               << (committed ? "new" : "previous") << " complete root\n";
 }
 
+void pin_registration_crash_case(const std::string& path)
+{
+    create_store(path);
+    auto file = lager::persistent_storage_file::open(path);
+    auto journal = file.roots();
+    const auto roots = journal.recover();
+    const auto& root = root_for(roots, store_id);
+
+    const auto child = ::fork();
+    require(child >= 0, "fork failed for pin-registration crash test");
+    if (child == 0) {
+        auto child_file = lager::persistent_storage_file::open(path);
+        auto child_journal = child_file.roots();
+        if (::setenv("LAGER_PERSISTENT_FAILPOINT", "pin-registration", 1) != 0)
+            ::_exit(4);
+        (void) child_journal.pin_root_handle(root.store_id,
+                                             root.generation,
+                                             root.root,
+                                             root.layout_id);
+        ::_exit(5);
+    }
+
+    int status = 0;
+    require(::waitpid(child, &status, 0) == child,
+            "waitpid failed for pin-registration crash test");
+    require(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL,
+            "reader did not die during pin registration");
+
+    // Enumeration reaps the dead claimant before the next process uses the
+    // slot. A fresh pin then proves the bounded table has reusable capacity.
+    require(journal.pinned_roots().empty(),
+            "dead pin-registration claimant left a visible reader root");
+    auto live_pin = journal.pin_root_handle(root.store_id,
+                                            root.generation,
+                                            root.root,
+                                            root.layout_id);
+    const auto pins = journal.pinned_roots();
+    require(pins.size() == 1 && pins.front().root == root.root,
+            "reader pin slot was not reusable after dead-process cleanup");
+    live_pin.reset();
+    require(journal.pinned_roots().empty(),
+            "released verification pin remained registered");
+    std::cout << "dead process during pin registration was reaped and the "
+                 "slot table accepted a new reader\n";
+}
+
 const lager::durable_root_descriptor& root_for(
     const std::vector<lager::durable_root_descriptor>& roots,
     std::uint64_t id)
@@ -1880,6 +1926,8 @@ int main(int argc, char** argv)
             shared_ephemeral_process_round_trip();
         else if (mode == "crash" && argc == 4)
             crash_case(path, argv[3]);
+        else if (mode == "pin-registration-crash" && argc == 3)
+            pin_registration_crash_case(path);
         else if (mode == "transactions" && argc == 3)
             transaction_semantics(path);
         else if (mode == "race" && argc == 3)

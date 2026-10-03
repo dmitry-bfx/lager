@@ -158,11 +158,12 @@ those tests pass.
   candidate snapshot pinned across collection, and reads the grafted value
   afterward. The mapped pinned-graft process test covers tracing reachability,
   but mapped reclamation is disabled.
-* **Death during pin registration or publication:** persistent writer crash
-  failpoints cover durable publication boundaries; there is no deterministic
-  process-death failpoint during reader pin registration. Dead-reader cleanup
-  is exercised by existing process tests, but PID reuse and slot-reuse races
-  remain unresolved. No multiprocess reclamation claim is made.
+* **Death during pin registration or publication:** a deterministic persistent
+  failpoint kills a reader after it claims a slot but before descriptor
+  publication; the parent reaps it and successfully registers another pin.
+  Persistent writer crash failpoints cover durable publication boundaries.
+  PID reuse and concurrent pin-slot reuse during collection remain unresolved.
+  No multiprocess reclamation claim is made.
 
 Today, persistent root records, mapped pin descriptors, mapped node bytes, and
 the shared-ephemeral root/pin tables are process-shared. `shared_ptr` snapshot
@@ -177,10 +178,11 @@ the commit-time candidate pin is published. Reclamation is disabled for mapped
 extents, so that allocation-to-pin gap is not safe for reuse today.
 
 Existing crash failpoints exercise writer death at allocation, data flush,
-root-record body write, durable marker, and cache publication. They do not
-exercise death during shared pin registration. The process-shared pin reaper
-also identifies owners by PID without a PID-reuse-resistant process-start
-token. Both are open protocol cases, not covered by the local arena test.
+root-record body write, durable marker, and cache publication, plus reader death
+after pin-slot claim and before descriptor publication. The process-shared pin
+reaper identifies owners by PID without a PID-reuse-resistant process-start
+token. PID reuse and a reader/collector registration handshake remain open
+protocol cases, not covered by the local arena test.
 
 The coordinator lock in the controlled phase is intentionally not the final
 audio-thread protocol. Lock-free, allocation-free snapshot registration and
