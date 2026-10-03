@@ -7,6 +7,7 @@
 #pragma once
 
 #include <lager/storage.hpp>
+#include <lager/process_identity.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -119,12 +120,12 @@ class shared_ephemeral_storage
         struct reader_slot
         {
             std::atomic<std::uint64_t> process_id{0};
+            std::atomic<std::uint64_t> process_start_token{0};
             std::atomic<std::uint64_t> sequence{0};
             std::atomic<std::uint64_t> store_id{0};
             std::atomic<std::uint64_t> generation{0};
             std::atomic<std::uint64_t> root_bits{0};
             std::atomic<std::uint64_t> layout_id{0};
-            std::atomic<std::uint64_t> thread_id{0};
         };
 
         struct header
@@ -207,10 +208,12 @@ class shared_ephemeral_storage
             reader_pin_lease(std::shared_ptr<mapping_owner> owner_,
                              std::size_t slot_,
                              std::uint64_t process_id_,
+                             std::uint64_t process_start_token_,
                              std::uint64_t active_sequence_)
                 : owner{std::move(owner_)},
                   slot{slot_},
                   process_id{process_id_},
+                  process_start_token{process_start_token_},
                   active_sequence{active_sequence_}
             {}
 
@@ -232,7 +235,7 @@ class shared_ephemeral_storage
                 pin.store_id.store(0, std::memory_order_relaxed);
                 pin.generation.store(0, std::memory_order_relaxed);
                 pin.layout_id.store(0, std::memory_order_relaxed);
-                pin.thread_id.store(0, std::memory_order_relaxed);
+                pin.process_start_token.store(0, std::memory_order_relaxed);
                 pin.process_id.store(0, std::memory_order_seq_cst);
                 pin.sequence.store(next_free_pin_sequence(active_sequence),
                                    std::memory_order_seq_cst);
@@ -242,6 +245,7 @@ class shared_ephemeral_storage
             std::shared_ptr<mapping_owner> owner;
             std::size_t slot;
             std::uint64_t process_id;
+            std::uint64_t process_start_token;
             std::uint64_t active_sequence;
         };
 
@@ -350,9 +354,7 @@ class shared_ephemeral_storage
                 throw std::invalid_argument{
                     "shared ephemeral root pin is invalid"};
             const auto process_id = static_cast<std::uint64_t>(::getpid());
-            const auto thread_id =
-                static_cast<std::uint64_t>(std::hash<std::thread::id>{}(
-                    std::this_thread::get_id()));
+            const auto process_start_token = current_process_start_token();
             auto* header = disk_header();
             for (int attempt = 0; attempt != 2; ++attempt) {
                 for (std::size_t i = 0; i < std::size(header->readers); ++i) {
@@ -392,14 +394,14 @@ class shared_ephemeral_storage
                         free_sequence + pin_active_state;
                     slot.sequence.store(claiming_sequence,
                                         std::memory_order_seq_cst);
+                    slot.process_start_token.store(process_start_token,
+                                                   std::memory_order_relaxed);
                     slot.store_id.store(store_id, std::memory_order_relaxed);
                     slot.generation.store(generation,
                                           std::memory_order_relaxed);
                     slot.root_bits.store(root.bits(),
                                          std::memory_order_relaxed);
                     slot.layout_id.store(layout_id,
-                                         std::memory_order_relaxed);
-                    slot.thread_id.store(thread_id,
                                          std::memory_order_relaxed);
                     slot.sequence.store(active_sequence,
                                         std::memory_order_seq_cst);
@@ -408,9 +410,11 @@ class shared_ephemeral_storage
                             new reader_pin_lease{shared_from_this(),
                                                  i,
                                                  process_id,
+                                                 process_start_token,
                                                  active_sequence}};
                     } catch (...) {
-                        clear_reader_pin(slot, process_id);
+                        clear_reader_pin(
+                            slot, process_id, process_start_token);
                         throw;
                     }
                 }
@@ -433,8 +437,12 @@ class shared_ephemeral_storage
                         complete = true;
                         break;
                     }
-                    if (!process_alive(process_id)) {
-                        clear_reader_pin(slot, process_id);
+                    const auto process_start_token =
+                        slot.process_start_token.load(
+                            std::memory_order_relaxed);
+                    if (!process_alive(process_id, process_start_token)) {
+                        clear_reader_pin(
+                            slot, process_id, process_start_token);
                         complete = true;
                         break;
                     }
@@ -460,7 +468,10 @@ class shared_ephemeral_storage
                     if (slot.sequence.load(std::memory_order_seq_cst) !=
                             sequence ||
                         slot.process_id.load(std::memory_order_seq_cst) !=
-                            process_id) {
+                            process_id ||
+                        slot.process_start_token.load(
+                            std::memory_order_relaxed) !=
+                            process_start_token) {
                         std::this_thread::yield();
                         continue;
                     }
@@ -500,21 +511,54 @@ class shared_ephemeral_storage
             return result;
         }
 
-        static bool process_alive(std::uint64_t process_id) noexcept
+        static std::uint64_t current_process_start_token() noexcept
+        {
+            struct process_token_cache
+            {
+                pid_t process_id = 0;
+                std::uint64_t start_token = 0;
+            };
+            static thread_local process_token_cache cache;
+            const auto process_id = ::getpid();
+            if (cache.process_id != process_id) {
+                const auto identity = detail::inspect_process_identity(
+                    static_cast<std::uint64_t>(process_id));
+                cache.process_id = process_id;
+                cache.start_token = identity ? identity->start_time : 0;
+            }
+            return cache.start_token;
+        }
+
+        static bool process_alive(std::uint64_t process_id,
+                                  std::uint64_t process_start_token) noexcept
         {
             if (process_id == 0)
                 return false;
+            if (process_id == std::numeric_limits<std::uint64_t>::max())
+                return true;
             if (process_id > static_cast<std::uint64_t>(
                                  std::numeric_limits<pid_t>::max()))
                 return true;
-            if (::kill(static_cast<pid_t>(process_id), 0) == 0)
-                return true;
-            return errno != ESRCH;
+            if (::kill(static_cast<pid_t>(process_id), 0) != 0 &&
+                errno == ESRCH)
+                return false;
+            if (process_start_token != 0) {
+                const auto identity =
+                    detail::inspect_process_identity(process_id);
+                if (identity)
+                    return identity->running &&
+                           identity->start_time == process_start_token;
+            }
+            return true;
         }
 
         static void clear_reader_pin(reader_slot& slot,
-                                     std::uint64_t process_id) noexcept
+                                     std::uint64_t process_id,
+                                     std::uint64_t process_start_token) noexcept
         {
+            if (slot.process_start_token.load(std::memory_order_relaxed) !=
+                process_start_token)
+                return;
             auto expected = process_id;
             if (!slot.process_id.compare_exchange_strong(
                     expected,
@@ -531,7 +575,7 @@ class shared_ephemeral_storage
             slot.store_id.store(0, std::memory_order_relaxed);
             slot.generation.store(0, std::memory_order_relaxed);
             slot.layout_id.store(0, std::memory_order_relaxed);
-            slot.thread_id.store(0, std::memory_order_relaxed);
+            slot.process_start_token.store(0, std::memory_order_relaxed);
             const auto next_free = next_free_pin_sequence(sequence);
             if (next_free >= sequence)
                 slot.sequence.store(next_free, std::memory_order_seq_cst);
@@ -543,8 +587,12 @@ class shared_ephemeral_storage
             for (auto& slot : disk_header()->readers) {
                 const auto process_id =
                     slot.process_id.load(std::memory_order_seq_cst);
-                if (process_id != 0 && !process_alive(process_id))
-                    clear_reader_pin(slot, process_id);
+                const auto process_start_token =
+                    slot.process_start_token.load(std::memory_order_relaxed);
+                if (process_id != 0 &&
+                    !process_alive(process_id, process_start_token))
+                    clear_reader_pin(
+                        slot, process_id, process_start_token);
             }
         }
 
@@ -773,7 +821,7 @@ public:
 
             std::memset(address, 0, page);
             auto* header = ::new (address) mapping_owner::header{};
-            header->version = 4;
+            header->version = 5;
             header->extent_id = extent_id;
             header->slot_size = slot_size;
             header->slot_alignment = slot_alignment;
@@ -883,7 +931,7 @@ public:
                 static_cast<const mapping_owner::header*>(address);
             const auto header_ok =
                 std::memcmp(header->magic, magic, sizeof(magic)) == 0 &&
-                header->version == 4 &&
+                header->version == 5 &&
                 header->extent_id == expected_extent_id &&
                 header->slot_size == expected_slot_size &&
                 header->slot_alignment == expected_alignment &&

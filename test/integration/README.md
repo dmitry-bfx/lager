@@ -105,10 +105,13 @@ reader/candidate pin descriptors are process-shared. Runtime domain
 descriptors, extent-directory snapshots, and slot bitmaps are process-local.
 Each pin table is bounded at 24 simultaneous pins; pins from processes that
 have exited and been reaped are cleared when roots are enumerated or a new pin
-needs space. Mapped extents still set `can_reclaim_slots` to false, so
-collection does not make slots reusable. Allocation-generation coordination,
-concurrent multiprocess marking/sweeping, and reader-safe slot reuse remain
-unfinished.
+needs space. On Linux, pin ownership includes process start time to distinguish
+PID reuse. The persistent root-journal and shared-ephemeral control formats
+were advanced; older formats are rejected and have no migration path yet.
+Mapped extents still set `can_reclaim_slots` to false, so collection does not
+make mapped slots reusable. Shared allocation-generation coordination,
+concurrent multiprocess marking/sweeping, and end-to-end reader-safe mapped
+reclamation remain unfinished.
 
 ## Remaining spec gaps confirmed by this run
 

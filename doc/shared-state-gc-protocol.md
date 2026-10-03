@@ -102,12 +102,13 @@ writer-registration handshake. Persistent journal and shared-ephemeral reader pi
 advance the sequence on reuse. Root enumeration retries while a live claim is
 being published and validates the same active sequence before accepting its
 descriptor. The pin-registration crash test covers process death between PID
-claim and descriptor publication for persistent pins. Both tables identify
-owners by PID alone, so PID reuse can make a dead pin appear live.
-The persistent root-journal format and root-table control-page magic were
-advanced for the sequence format; older stores are rejected rather than
-reinitialized so opening a store cannot silently erase another process's live
-pins. No on-disk migration is implemented yet.
+claim and descriptor publication for persistent pins. On Linux both tables
+also store the process start time from `/proc/<pid>/stat`; cleanup checks the
+PID and start time so a reused PID does not keep the old pin alive. On systems
+where process start time is unavailable, cleanup falls back conservatively to
+PID liveness, and PID reuse can still leak a pin. The persistent journal and
+shared-ephemeral mapping versions were advanced; older stores/arenas are
+rejected instead of reinitialized. No on-disk migration is implemented yet.
 
 * A reader claims a slot before loading the root, writes its descriptor, then
   publishes `ACTIVE` with release ordering and validates the root sequence.

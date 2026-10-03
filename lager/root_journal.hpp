@@ -7,6 +7,7 @@
 #pragma once
 
 #include <immer/storage_ptr.hpp>
+#include <lager/process_identity.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -133,12 +134,12 @@ class persistent_root_journal
         struct reader_slot
         {
             std::atomic<std::uint64_t> process_id{0};
+            std::atomic<std::uint64_t> process_start_token{0};
             std::atomic<std::uint64_t> sequence{0};
             std::atomic<std::uint64_t> store_id{0};
             std::atomic<std::uint64_t> generation{0};
             std::atomic<std::uint64_t> root_bits{0};
             std::atomic<std::uint64_t> layout_id{0};
-            std::atomic<std::uint64_t> thread_id{0};
         } readers[24];
     };
     static constexpr std::uint64_t reader_pin_state_mask = 3;
@@ -164,9 +165,9 @@ class persistent_root_journal
 
     static_assert(64 + sizeof(shared_root_table) <= 4096,
                   "persistent root cache must fit in the journal header page");
-    static constexpr std::uint32_t format_version = 6;
+    static constexpr std::uint32_t format_version = 8;
     static constexpr std::size_t root_table_offset = 64;
-    static constexpr std::uint64_t root_table_magic = 0x4c41474552544336ULL;
+    static constexpr std::uint64_t root_table_magic = 0x4c41474552544338ULL;
     static constexpr std::uint64_t publication_stage_mask = 3;
     static constexpr std::uint64_t publication_stage_precommit = 1;
     static constexpr std::uint64_t publication_stage_durable = 2;
@@ -390,9 +391,7 @@ public:
         if (store_id == 0 || !root || layout_id == 0)
             throw std::invalid_argument{"persistent root pin is invalid"};
         const auto process_id = static_cast<std::uint64_t>(::getpid());
-        const auto raw_thread_id =
-            static_cast<std::uint64_t>(std::hash<std::thread::id>{}(
-                std::this_thread::get_id()));
+        const auto process_start_token = current_process_start_token();
         auto* table = root_table();
         for (int attempt = 0; attempt != 2; ++attempt) {
             for (std::size_t i = 0; i < std::size(table->readers); ++i) {
@@ -434,19 +433,25 @@ public:
                                              reader_pin_active_state;
                 slot.sequence.store(claiming_sequence,
                                     std::memory_order_seq_cst);
+                slot.process_start_token.store(process_start_token,
+                                               std::memory_order_relaxed);
                 slot.store_id.store(store_id, std::memory_order_relaxed);
                 slot.generation.store(generation, std::memory_order_relaxed);
                 slot.root_bits.store(root.bits(), std::memory_order_relaxed);
                 slot.layout_id.store(layout_id, std::memory_order_relaxed);
-                slot.thread_id.store(raw_thread_id, std::memory_order_relaxed);
                 slot.sequence.store(active_sequence,
                                     std::memory_order_seq_cst);
                 try {
                     return std::shared_ptr<void>{
                         new reader_pin_lease{
-                            state_, i, process_id, active_sequence}};
+                            state_,
+                            i,
+                            process_id,
+                            process_start_token,
+                            active_sequence}};
                 } catch (...) {
-                    clear_dead_reader_pin(slot, process_id);
+                    clear_dead_reader_pin(
+                        slot, process_id, process_start_token);
                     throw;
                 }
             }
@@ -477,8 +482,11 @@ public:
                     complete = true;
                     break;
                 }
-                if (!process_alive(process_id)) {
-                    clear_dead_reader_pin(slot, process_id);
+                const auto process_start_token =
+                    slot.process_start_token.load(std::memory_order_relaxed);
+                if (!process_alive(process_id, process_start_token)) {
+                    clear_dead_reader_pin(
+                        slot, process_id, process_start_token);
                     complete = true;
                     break;
                 }
@@ -504,7 +512,9 @@ public:
                     slot.layout_id.load(std::memory_order_relaxed);
                 if (slot.sequence.load(std::memory_order_seq_cst) != sequence ||
                     slot.process_id.load(std::memory_order_seq_cst) !=
-                        process_id) {
+                        process_id ||
+                    slot.process_start_token.load(std::memory_order_relaxed) !=
+                        process_start_token) {
                     std::this_thread::yield();
                     continue;
                 }
@@ -678,10 +688,12 @@ private:
         reader_pin_lease(std::shared_ptr<journal_state> state_,
                          std::size_t slot_,
                          std::uint64_t process_id_,
+                         std::uint64_t process_start_token_,
                          std::uint64_t active_sequence_)
             : state{std::move(state_)},
               slot{slot_},
               process_id{process_id_},
+              process_start_token{process_start_token_},
               active_sequence{active_sequence_}
         {}
 
@@ -705,7 +717,7 @@ private:
             pin.store_id.store(0, std::memory_order_relaxed);
             pin.generation.store(0, std::memory_order_relaxed);
             pin.layout_id.store(0, std::memory_order_relaxed);
-            pin.thread_id.store(0, std::memory_order_relaxed);
+            pin.process_start_token.store(0, std::memory_order_relaxed);
             pin.process_id.store(0, std::memory_order_seq_cst);
             pin.sequence.store(
                 persistent_root_journal::next_free_reader_pin_sequence(
@@ -716,6 +728,7 @@ private:
         std::shared_ptr<journal_state> state;
         std::size_t slot;
         std::uint64_t process_id;
+        std::uint64_t process_start_token;
         std::uint64_t active_sequence;
     };
 
@@ -783,6 +796,7 @@ private:
             !table->roots[0].sequence.is_lock_free() ||
             !table->roots[0].banks[0].generation.is_lock_free() ||
             !table->readers[0].process_id.is_lock_free() ||
+            !table->readers[0].process_start_token.is_lock_free() ||
             !table->readers[0].sequence.is_lock_free() ||
             !table->readers[0].root_bits.is_lock_free())
             throw std::runtime_error{
@@ -805,22 +819,54 @@ private:
         return empty;
     }
 
-    static bool process_alive(std::uint64_t process_id) noexcept
+    static std::uint64_t current_process_start_token() noexcept
+    {
+        struct process_token_cache
+        {
+            pid_t process_id = 0;
+            std::uint64_t start_token = 0;
+        };
+        static thread_local process_token_cache cache;
+        const auto process_id = ::getpid();
+        if (cache.process_id != process_id) {
+            const auto identity = detail::inspect_process_identity(
+                static_cast<std::uint64_t>(process_id));
+            cache.process_id = process_id;
+            cache.start_token = identity ? identity->start_time : 0;
+        }
+        return cache.start_token;
+    }
+
+    static bool process_alive(std::uint64_t process_id,
+                              std::uint64_t process_start_token) noexcept
     {
         if (process_id == 0)
             return false;
+        if (process_id == std::numeric_limits<std::uint64_t>::max())
+            return true;
         if (process_id > static_cast<std::uint64_t>(
                              std::numeric_limits<pid_t>::max()))
             return true;
-        if (::kill(static_cast<pid_t>(process_id), 0) == 0)
-            return true;
-        return errno != ESRCH;
+        if (::kill(static_cast<pid_t>(process_id), 0) != 0 && errno == ESRCH)
+            return false;
+        if (process_start_token != 0) {
+            const auto identity =
+                detail::inspect_process_identity(process_id);
+            if (identity)
+                return identity->running &&
+                       identity->start_time == process_start_token;
+        }
+        return true;
     }
 
     static void clear_dead_reader_pin(
         typename shared_root_table::reader_slot& slot,
-        std::uint64_t process_id) noexcept
+        std::uint64_t process_id,
+        std::uint64_t process_start_token) noexcept
     {
+        if (slot.process_start_token.load(std::memory_order_relaxed) !=
+            process_start_token)
+            return;
         auto expected = process_id;
         if (!slot.process_id.compare_exchange_strong(
                 expected,
@@ -838,7 +884,7 @@ private:
         slot.store_id.store(0, std::memory_order_relaxed);
         slot.generation.store(0, std::memory_order_relaxed);
         slot.layout_id.store(0, std::memory_order_relaxed);
-        slot.thread_id.store(0, std::memory_order_relaxed);
+        slot.process_start_token.store(0, std::memory_order_relaxed);
         const auto next_free = next_free_reader_pin_sequence(sequence);
         if (next_free >= sequence)
             slot.sequence.store(next_free, std::memory_order_seq_cst);
@@ -850,8 +896,12 @@ private:
         for (auto& slot : root_table()->readers) {
             const auto process_id =
                 slot.process_id.load(std::memory_order_seq_cst);
-            if (process_id != 0 && !process_alive(process_id))
-                clear_dead_reader_pin(slot, process_id);
+            const auto process_start_token =
+                slot.process_start_token.load(std::memory_order_relaxed);
+            if (process_id != 0 &&
+                !process_alive(process_id, process_start_token))
+                clear_dead_reader_pin(
+                    slot, process_id, process_start_token);
         }
     }
 
