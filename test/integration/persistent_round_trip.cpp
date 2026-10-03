@@ -611,6 +611,15 @@ void read_store(const std::string& path, bool updated)
         runtime, *found, layout_sample, journal);
     const auto snapshot = runtime.read(store);
     const auto layout = lager::persistent_layout(layout_sample, 1);
+    bool mismatched_layout_rejected = false;
+    try {
+        snapshot.with_root<root_state>(layout.fingerprint ^ 1,
+                                       [](const auto&) {});
+    } catch (const std::invalid_argument&) {
+        mismatched_layout_rejected = true;
+    }
+    require(mismatched_layout_rejected,
+            "reader accepted a mismatched persistent layout fingerprint");
     snapshot.with_root<root_state>(layout.fingerprint, [&](const auto& root) {
         require(root.values.size() == value_count,
                 "reader found the wrong number of values");
