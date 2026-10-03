@@ -63,6 +63,13 @@ ephemeral reader's old value stays readable. Reaping that reader removes its
 pin. These checks validate pin publication and dead-process cleanup, but not
 reclamation safety.
 
+The persistent pinned-graft check keeps a second process on an old dependency
+snapshot, commits a newer dependency root, then publishes a target root that
+reuses the old vector subtree. It captures roots for tracing while the old
+reader is still pinned and confirms both the reader and the new root retain the
+old value. Slot reclamation remains disabled, so this verifies root capture
+and graph reachability, not reuse safety.
+
 The durable root journal, mapped node bytes, shared-ephemeral root table, and
 reader/candidate pin descriptors are process-shared. Runtime domain
 descriptors, extent-directory snapshots, and slot bitmaps are process-local.

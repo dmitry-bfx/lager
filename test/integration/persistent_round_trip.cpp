@@ -207,7 +207,10 @@ void create_store(const std::string& path)
         auto journal = file.roots();
         auto store = lager::create_persistent_substore(
             runtime, {store_id}, root, journal);
-        auto dependency_values = values_type{}.push_back(8675309);
+        auto dependency_builder = values_type{}.transient();
+        for (std::size_t i = 0; i < 1024; ++i)
+            dependency_builder.push_back(8675309 + static_cast<int>(i));
+        auto dependency_values = std::move(dependency_builder).persistent();
         auto dependency_root = immer::make_storage<root_state>(
             root_state{std::move(dependency_values)});
         (void) lager::create_persistent_substore(
@@ -1070,6 +1073,179 @@ void cross_process_dependency(const std::string& path)
     std::cout << "exact cross-domain reads rejected a stale process-local "
                  "candidate through the durable journal\n";
 }
+
+int persistent_graft_reader_child(const std::string& path,
+                                  std::uint64_t layout_id,
+                                  int ready_fd,
+                                  int release_fd)
+{
+    auto file = lager::persistent_storage_file::open(path);
+    lager::shared_store_runtime runtime;
+    auto mappings = file.map_existing_extents();
+    for (const auto& mapping : mappings)
+        runtime.publish_extent(mapping.view());
+    auto journal = file.roots();
+    const auto roots = journal.recover();
+    auto storage = runtime.activate_storage();
+    const root_state layout_sample{};
+    auto dependency = lager::restore_persistent_substore(
+        runtime,
+        root_for(roots, dependency_store_id),
+        layout_sample,
+        journal);
+    const auto snapshot = runtime.read(dependency);
+    const char ready = 'r';
+    if (::write(ready_fd, &ready, 1) != 1)
+        return 4;
+    char release = 0;
+    if (::read(release_fd, &release, 1) != 1)
+        return 5;
+    snapshot.with_root<root_state>(layout_id, [](const auto& old_root) {
+        require(old_root.values.size() == 1024 &&
+                    old_root.values[0] == 8675309,
+                "pinned persistent reader lost its old subtree");
+    });
+    return 0;
+}
+
+void persistent_snapshot_graft(const std::string& path)
+{
+    create_store(path);
+    auto file = lager::persistent_storage_file::open(path);
+    lager::shared_store_runtime runtime;
+    auto mappings = file.map_existing_extents();
+    for (const auto& mapping : mappings)
+        runtime.publish_extent(mapping.view());
+    auto journal = file.roots();
+    const auto roots = journal.recover();
+    auto storage = runtime.activate_storage();
+    const root_state layout_sample{};
+    const auto layout = lager::persistent_layout(layout_sample, 1);
+    auto target = lager::restore_persistent_substore(
+        runtime, root_for(roots, store_id), layout_sample, journal);
+    auto dependency = lager::restore_persistent_substore(
+        runtime,
+        root_for(roots, dependency_store_id),
+        layout_sample,
+        journal);
+    const auto old_dependency = root_for(roots, dependency_store_id);
+
+    int ready_pipe[2];
+    int release_pipe[2];
+    require(::pipe(ready_pipe) == 0 && ::pipe(release_pipe) == 0,
+            "could not create persistent graft reader pipes");
+    const auto reader = ::fork();
+    require(reader >= 0, "fork failed for persistent graft reader");
+    if (reader == 0) {
+        ::close(ready_pipe[0]);
+        ::close(release_pipe[1]);
+        try {
+            ::_exit(persistent_graft_reader_child(path,
+                                                  layout.fingerprint,
+                                                  ready_pipe[1],
+                                                  release_pipe[0]));
+        } catch (...) {
+            ::_exit(3);
+        }
+    }
+    ::close(ready_pipe[1]);
+    ::close(release_pipe[0]);
+    char ready = 0;
+    require(::read(ready_pipe[0], &ready, 1) == 1,
+            "persistent graft reader did not pin its old snapshot");
+    auto pins = journal.pinned_roots();
+    require(std::any_of(pins.begin(), pins.end(), [&](const auto& pin) {
+                return pin.store_id == dependency_store_id &&
+                       pin.generation == old_dependency.generation &&
+                       pin.root == old_dependency.root;
+            }),
+            "persistent graft reader pin was not process-shared");
+
+    {
+        const auto old_snapshot = runtime.read(dependency);
+        auto transaction = runtime.begin_transaction(target);
+        std::set<std::uint64_t> old_nodes;
+        auto grafted_values = old_snapshot.with_root<root_state>(
+            layout.fingerprint,
+            [&](const auto& old_root) {
+                traced_nodes visitor;
+                old_root.values.trace_children(visitor);
+                old_nodes = std::move(visitor.bits);
+                return old_root.values;
+            });
+        auto candidate = immer::make_storage<root_state>(
+            root_state{std::move(grafted_values)});
+
+        auto dependency_update = runtime.begin_transaction(dependency);
+        (void) lager::update_persistent_root<root_state>(
+            dependency_update,
+            layout_sample,
+            [](const root_state& old_root) {
+                auto updated = old_root;
+                updated.values = updated.values.set(0, 8675312);
+                return updated;
+            },
+            journal);
+        (void) transaction.commit_persistent_root(
+            candidate.template rebind<void>(),
+            layout.fingerprint,
+            journal);
+        const auto committed = runtime.read(target);
+        committed.with_root<root_state>(layout.fingerprint,
+            [&](const auto& new_root) {
+                traced_nodes visitor;
+                new_root.values.trace_children(visitor);
+                std::vector<std::uint64_t> shared_nodes;
+                std::set_intersection(old_nodes.begin(),
+                                      old_nodes.end(),
+                                      visitor.bits.begin(),
+                                      visitor.bits.end(),
+                                      std::back_inserter(shared_nodes));
+                require(!shared_nodes.empty(),
+                        "grafted persistent vector did not share tree nodes");
+            });
+    }
+
+    auto current_target = runtime.read(target);
+    current_target.with_root<root_state>(layout.fingerprint,
+        [](const auto& root) {
+            require(root.values.size() == 1024 &&
+                        root.values[0] == 8675309 &&
+                        root.values[1023] == 8676332,
+                    "new root did not retain the grafted old subtree");
+        });
+    lager::tracing_collector collector{current_target.extents()};
+    collector.add_persistent_roots<root_state>(journal,
+                                               layout.fingerprint);
+    pins = journal.pinned_roots();
+    require(std::any_of(pins.begin(), pins.end(), [&](const auto& pin) {
+                return pin.store_id == dependency_store_id &&
+                       pin.generation == old_dependency.generation &&
+                       pin.root == old_dependency.root;
+            }),
+            "GC root capture omitted the pinned old graft source");
+    require(collector.collect() == 0,
+            "persistent collector reclaimed a pinned graft source");
+
+    const char release = 'g';
+    require(::write(release_pipe[1], &release, 1) == 1,
+            "could not release persistent graft reader");
+    int status = 0;
+    require(::waitpid(reader, &status, 0) == reader && WIFEXITED(status) &&
+                WEXITSTATUS(status) == 0,
+            "persistent graft reader did not retain its old snapshot");
+    ::close(ready_pipe[0]);
+    ::close(release_pipe[1]);
+    pins = journal.pinned_roots();
+    require(std::none_of(pins.begin(), pins.end(), [&](const auto& pin) {
+                return pin.store_id == dependency_store_id &&
+                       pin.generation == old_dependency.generation &&
+                       pin.root == old_dependency.root;
+            }),
+            "finished persistent graft reader left its pin registered");
+    std::cout << "persistent commit grafted a subtree from an old pinned "
+                 "snapshot while GC captured its roots\n";
+}
 #endif
 
 } // namespace
@@ -1107,6 +1283,8 @@ int main(int argc, char** argv)
             competing_writers(path);
         else if (mode == "cross-dependency" && argc == 3)
             cross_process_dependency(path);
+        else if (mode == "graft" && argc == 3)
+            persistent_snapshot_graft(path);
 #endif
         else if (mode == "read" && argc == 4) {
             const std::string stage{argv[3]};
