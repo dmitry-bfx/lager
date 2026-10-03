@@ -79,6 +79,11 @@ enumeration reaps the dead claimant, after which another reader successfully
 uses the pin table. This checks dead-process cleanup, not concurrent mapped
 reclamation safety.
 
+`persistent-round-trip-pin-release-reuse` pauses root enumeration after it
+samples an active pin sequence, releases that pin, reuses the same slot for a
+different descriptor, and resumes enumeration. The scanner must reject the
+mixed sample and return the replacement descriptor by its new sequence.
+
 `persistent-round-trip-controlled-gc` uses an in-memory, single-process arena
 with reclamation enabled. Barriers force a reader to attempt acquisition during
 root capture and a writer to publish a pre-capture candidate afterward. The

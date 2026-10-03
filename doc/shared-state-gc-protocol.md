@@ -104,9 +104,10 @@ being published and validates the same active sequence before accepting its
 descriptor. The pin-registration crash test covers process death between PID
 claim and descriptor publication for persistent pins. Both tables identify
 owners by PID alone, so PID reuse can make a dead pin appear live.
-The persistent root-table control-page magic was advanced for the sequence
-format; an unknown nonzero table version is rejected rather than reinitialized
-so opening a store cannot silently erase another process's live pins.
+The persistent root-journal format and root-table control-page magic were
+advanced for the sequence format; older stores are rejected rather than
+reinitialized so opening a store cannot silently erase another process's live
+pins. No on-disk migration is implemented yet.
 
 * A reader claims a slot before loading the root, writes its descriptor, then
   publishes `ACTIVE` with release ordering and validates the root sequence.
@@ -151,9 +152,11 @@ those tests pass.
   the captured roots. Mapped readers do not share this coordinator today.
 * **Pin release followed by slot reuse:** the controlled test releases a pin,
   immediately reuses its slot, then sends the old release token again. The
-  incremented sequence leaves the new pin active. Both process-shared tables
-  now use monotonic sequence tokens, though a dedicated concurrent slot-reuse
-  interleaving test is still needed before reclamation.
+  incremented sequence leaves the new pin active. A second deterministic test
+  pauses persistent root enumeration after it samples the old active sequence,
+  reuses the same mapped slot, then verifies that enumeration retries and
+  returns the replacement descriptor. Both process-shared tables use monotonic
+  sequence tokens.
 * **Pre-capture candidate published after capture:** the controlled test
   registers the candidate in a live transaction, pauses collection after root
   capture, and attempts publication from another thread. The candidate remains

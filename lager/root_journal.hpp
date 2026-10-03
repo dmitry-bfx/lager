@@ -164,7 +164,7 @@ class persistent_root_journal
 
     static_assert(64 + sizeof(shared_root_table) <= 4096,
                   "persistent root cache must fit in the journal header page");
-    static constexpr std::uint32_t format_version = 5;
+    static constexpr std::uint32_t format_version = 6;
     static constexpr std::size_t root_table_offset = 64;
     static constexpr std::uint64_t root_table_magic = 0x4c41474552544336ULL;
     static constexpr std::uint64_t publication_stage_mask = 3;
@@ -177,6 +177,14 @@ class persistent_root_journal
 
 public:
     persistent_root_journal() = default;
+
+#if defined(LAGER_PERSISTENT_ROUND_TRIP_FAILPOINTS)
+    using test_hook_type = void (*)(const char*);
+    static void set_test_hook(test_hook_type hook) noexcept
+    {
+        test_hook_.store(hook, std::memory_order_release);
+    }
+#endif
 
     static persistent_root_journal open(const std::string& path)
     {
@@ -485,6 +493,7 @@ public:
                     std::this_thread::yield();
                     continue;
                 }
+                invoke_test_hook("pin-scan-active");
                 const auto store_id =
                     slot.store_id.load(std::memory_order_relaxed);
                 const auto generation =
@@ -1144,6 +1153,16 @@ private:
 #endif
     }
 
+    static void invoke_test_hook(const char* name)
+    {
+#if defined(LAGER_PERSISTENT_ROUND_TRIP_FAILPOINTS)
+        if (const auto hook = test_hook_.load(std::memory_order_acquire))
+            hook(name);
+#else
+        (void) name;
+#endif
+    }
+
     static void read_exact(int fd, void* data, std::size_t size, off_t offset)
     {
         auto* bytes = static_cast<unsigned char*>(data);
@@ -1199,6 +1218,9 @@ private:
     }
 
     std::shared_ptr<journal_state> state_;
+#if defined(LAGER_PERSISTENT_ROUND_TRIP_FAILPOINTS)
+    inline static std::atomic<test_hook_type> test_hook_{nullptr};
+#endif
 #else
     struct journal_state
     {};

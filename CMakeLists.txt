@@ -239,6 +239,9 @@ if (lager_BUILD_PERSISTENT_ROUND_TRIP)
     add_test(NAME persistent-round-trip-crash-pin-registration
       COMMAND lager-persistent-round-trip pin-registration-crash
         "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-pin-registration.store")
+    add_test(NAME persistent-round-trip-pin-release-reuse
+      COMMAND lager-persistent-round-trip pin-release-reuse
+        "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-pin-release-reuse.store")
     foreach(_stage allocation data-flush root-record-write root-record-commit
                    publication)
       add_test(NAME persistent-round-trip-crash-${_stage}

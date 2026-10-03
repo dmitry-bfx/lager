@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -264,6 +265,17 @@ private:
     bool arrived_ = false;
     bool released_ = false;
 };
+
+std::atomic<deterministic_gate*> persistent_pin_scan_gate{nullptr};
+
+void persistent_pin_scan_test_hook(const char* name)
+{
+    if (std::string{name} != "pin-scan-active")
+        return;
+    if (auto* gate = persistent_pin_scan_gate.exchange(
+            nullptr, std::memory_order_acq_rel))
+        gate->pause();
+}
 
 //! Deterministic, process-local coordinator for the first reclaiming arena.
 //! It serializes root/pin/transaction changes with root capture and sweep.
@@ -1114,6 +1126,55 @@ void pin_registration_crash_case(const std::string& path)
                  "slot table accepted a new reader\n";
 }
 
+void pin_release_reuse_interleaving(const std::string& path)
+{
+    create_store(path);
+    auto file = lager::persistent_storage_file::open(path);
+    auto journal = file.roots();
+    const auto roots = journal.recover();
+    const auto& root = root_for(roots, store_id);
+    auto old_pin = journal.pin_root_handle(root.store_id,
+                                           root.generation,
+                                           root.root,
+                                           root.layout_id);
+
+    deterministic_gate scan_gate;
+    persistent_pin_scan_gate.store(&scan_gate, std::memory_order_release);
+    lager::persistent_root_journal::set_test_hook(
+        &persistent_pin_scan_test_hook);
+    std::vector<lager::durable_root_descriptor> captured_pins;
+    std::exception_ptr scan_error;
+    std::thread scanner([&] {
+        try {
+            captured_pins = journal.pinned_roots();
+        } catch (...) {
+            scan_error = std::current_exception();
+        }
+    });
+    scan_gate.wait_until_arrived();
+
+    // The scanner has sampled the old ACTIVE sequence. Reuse the same table
+    // slot before it reads the descriptor; the old sequence must force retry.
+    old_pin.reset();
+    const auto replacement_store_id = store_id + 100;
+    auto replacement_pin = journal.pin_root_handle(
+        replacement_store_id,
+        root.generation + 1,
+        root.root,
+        root.layout_id);
+    scan_gate.release();
+    scanner.join();
+    lager::persistent_root_journal::set_test_hook(nullptr);
+    if (scan_error)
+        std::rethrow_exception(scan_error);
+    require(captured_pins.size() == 1 &&
+                captured_pins.front().store_id == replacement_store_id &&
+                captured_pins.front().generation == root.generation + 1,
+            "pin enumeration combined data across a slot reuse");
+    replacement_pin.reset();
+    std::cout << "pin enumeration retried after release and same-slot reuse\n";
+}
+
 const lager::durable_root_descriptor& root_for(
     const std::vector<lager::durable_root_descriptor>& roots,
     std::uint64_t id)
@@ -1928,6 +1989,8 @@ int main(int argc, char** argv)
             crash_case(path, argv[3]);
         else if (mode == "pin-registration-crash" && argc == 3)
             pin_registration_crash_case(path);
+        else if (mode == "pin-release-reuse" && argc == 3)
+            pin_release_reuse_interleaving(path);
         else if (mode == "transactions" && argc == 3)
             transaction_semantics(path);
         else if (mode == "race" && argc == 3)
