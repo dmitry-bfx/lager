@@ -220,6 +220,8 @@ if (lager_BUILD_PERSISTENT_ROUND_TRIP)
     FIXTURES_REQUIRED persistent-round-trip-store
     DEPENDS persistent-round-trip-update)
   if (UNIX)
+    add_test(NAME persistent-round-trip-controlled-gc
+      COMMAND lager-persistent-round-trip controlled-gc)
     add_test(NAME persistent-round-trip-shared-ephemeral
       COMMAND lager-persistent-round-trip ephemeral)
     add_test(NAME persistent-round-trip-transactions

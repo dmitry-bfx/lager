@@ -17,15 +17,22 @@
 #include <immer/variant.hpp>
 
 #include <algorithm>
+#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -218,6 +225,272 @@ struct traced_nodes
     template <typename T>
     void visit_value(const T&)
     {}
+};
+
+class deterministic_gate
+{
+public:
+    void pause()
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        arrived_ = true;
+        condition_.notify_all();
+        condition_.wait(lock, [&] { return released_; });
+    }
+
+    void signal()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        arrived_ = true;
+        condition_.notify_all();
+    }
+
+    void wait_until_arrived()
+    {
+        std::unique_lock<std::mutex> lock{mutex_};
+        condition_.wait(lock, [&] { return arrived_; });
+    }
+
+    void release()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        released_ = true;
+        condition_.notify_all();
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool arrived_ = false;
+    bool released_ = false;
+};
+
+//! Deterministic, process-local coordinator for the first reclaiming arena.
+//! It serializes root/pin/transaction changes with root capture and sweep.
+class controlled_gc_protocol
+    : public std::enable_shared_from_this<controlled_gc_protocol>
+{
+public:
+    using root_handle = immer::storage_ptr<root_state>;
+
+    struct pin_token
+    {
+        std::size_t slot;
+        std::uint64_t sequence;
+    };
+
+    struct transaction_token
+    {
+        std::size_t slot;
+        std::uint64_t sequence;
+        std::uint64_t base_generation;
+    };
+
+    class snapshot
+    {
+    public:
+        snapshot() = default;
+        snapshot(std::shared_ptr<controlled_gc_protocol> owner,
+                 pin_token token,
+                 root_handle root,
+                 std::uint64_t generation)
+            : owner_{std::move(owner)},
+              token_{token},
+              root_{root},
+              generation_{generation}
+        {}
+        snapshot(const snapshot&) = delete;
+        snapshot& operator=(const snapshot&) = delete;
+        snapshot(snapshot&& other) noexcept
+            : owner_{std::move(other.owner_)},
+              token_{other.token_},
+              root_{other.root_},
+              generation_{other.generation_}
+        {}
+        snapshot& operator=(snapshot&& other) noexcept
+        {
+            if (this == &other)
+                return *this;
+            reset();
+            owner_ = std::move(other.owner_);
+            token_ = other.token_;
+            root_ = other.root_;
+            generation_ = other.generation_;
+            return *this;
+        }
+        ~snapshot() { reset(); }
+
+        root_handle root() const noexcept { return root_; }
+        std::uint64_t generation() const noexcept { return generation_; }
+        pin_token token() const noexcept { return token_; }
+        void reset() noexcept
+        {
+            if (owner_)
+                owner_->release_pin(token_);
+            owner_.reset();
+            root_ = {};
+        }
+
+    private:
+        std::shared_ptr<controlled_gc_protocol> owner_;
+        pin_token token_{};
+        root_handle root_{};
+        std::uint64_t generation_ = 0;
+    };
+
+    controlled_gc_protocol(lager::extent_snapshot extents, root_handle initial)
+        : extents_{std::move(extents)}, current_{initial}
+    {}
+
+    snapshot read(std::function<void()> before_lock = {},
+                  std::function<void()> after_pin = {})
+    {
+        if (before_lock)
+            before_lock();
+        std::lock_guard<std::mutex> lock{mutex_};
+        for (std::size_t i = 0; i < pins_.size(); ++i) {
+            auto& slot = pins_[i];
+            if (slot.active)
+                continue;
+            if (slot.sequence == std::numeric_limits<std::uint64_t>::max())
+                throw std::overflow_error{"controlled pin sequence exhausted"};
+            ++slot.sequence;
+            slot.root = current_;
+            slot.active = true;
+            const pin_token token{i, slot.sequence};
+            if (after_pin)
+                after_pin();
+            return snapshot{shared_from_this(),
+                            token,
+                            slot.root,
+                            current_generation_};
+        }
+        throw std::length_error{"controlled arena pin table is full"};
+    }
+
+    transaction_token begin_transaction()
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        for (std::size_t i = 0; i < transactions_.size(); ++i) {
+            auto& slot = transactions_[i];
+            if (slot.active)
+                continue;
+            if (slot.sequence == std::numeric_limits<std::uint64_t>::max())
+                throw std::overflow_error{
+                    "controlled transaction sequence exhausted"};
+            ++slot.sequence;
+            slot.base = current_;
+            slot.candidate = {};
+            slot.base_generation = current_generation_;
+            slot.active = true;
+            return {i, slot.sequence, current_generation_};
+        }
+        throw std::length_error{"controlled arena transaction table is full"};
+    }
+
+    void set_candidate(transaction_token token, root_handle candidate)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto& slot = transaction(token);
+        slot.candidate = candidate;
+    }
+
+    void publish(transaction_token token)
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        auto& slot = transaction(token);
+        if (current_generation_ != token.base_generation ||
+            current_ != slot.base)
+            throw std::runtime_error{"controlled writer candidate is stale"};
+        if (!slot.candidate)
+            throw std::logic_error{"controlled writer has no candidate root"};
+        current_ = slot.candidate;
+        ++current_generation_;
+        slot.active = false;
+        slot.base = {};
+        slot.candidate = {};
+    }
+
+    std::size_t collect(std::function<void()> after_root_capture = {})
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        lager::tracing_collector collector{extents_};
+        collector.add_root(current_);
+        for (const auto& slot : pins_)
+            if (slot.active)
+                collector.add_root(slot.root);
+        for (const auto& slot : transactions_)
+            if (slot.active) {
+                collector.add_root(slot.base);
+                if (slot.candidate)
+                    collector.add_root(slot.candidate);
+            }
+        if (after_root_capture)
+            after_root_capture();
+        return collector.collect();
+    }
+
+    void release_pin(pin_token token) noexcept
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        if (token.slot >= pins_.size())
+            return;
+        auto& slot = pins_[token.slot];
+        if (!slot.active || slot.sequence != token.sequence)
+            return;
+        slot.root = {};
+        slot.active = false;
+    }
+
+    root_handle current() const
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return current_;
+    }
+
+    std::size_t pin_count() const
+    {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return static_cast<std::size_t>(std::count_if(
+            pins_.begin(), pins_.end(), [](const auto& slot) {
+                return slot.active;
+            }));
+    }
+
+private:
+    struct pin_slot
+    {
+        std::uint64_t sequence = 0;
+        bool active = false;
+        root_handle root{};
+    };
+
+    struct transaction_slot
+    {
+        std::uint64_t sequence = 0;
+        bool active = false;
+        std::uint64_t base_generation = 0;
+        root_handle base{};
+        root_handle candidate{};
+    };
+
+    transaction_slot& transaction(transaction_token token)
+    {
+        if (token.slot >= transactions_.size())
+            throw std::out_of_range{"controlled transaction slot is invalid"};
+        auto& slot = transactions_[token.slot];
+        if (!slot.active || slot.sequence != token.sequence ||
+            slot.base_generation != token.base_generation)
+            throw std::logic_error{"controlled transaction token is stale"};
+        return slot;
+    }
+
+    lager::extent_snapshot extents_;
+    mutable std::mutex mutex_;
+    root_handle current_;
+    std::uint64_t current_generation_ = 1;
+    std::array<pin_slot, 8> pins_{};
+    std::array<transaction_slot, 8> transactions_{};
 };
 
 void create_store(const std::string& path)
@@ -1336,6 +1609,215 @@ void persistent_snapshot_graft(const std::string& path)
     std::cout << "persistent commit grafted a subtree from an old pinned "
                  "snapshot while GC captured its roots\n";
 }
+
+void controlled_arena_reclamation()
+{
+    constexpr std::uint32_t local_extent_id = 91;
+    constexpr std::size_t local_slot_size = 1024;
+    constexpr std::size_t local_slot_alignment = 16;
+    constexpr std::size_t local_slot_count = 65536;
+    constexpr std::uint64_t local_layout_id = 0x434f4e54524f4c31ULL;
+    const auto byte_count = local_slot_size * local_slot_count;
+    auto* local_base = static_cast<std::byte*>(
+        ::operator new(byte_count, std::align_val_t{local_slot_alignment}));
+    std::shared_ptr<void> local_owner{
+        local_base,
+        [](void* memory) {
+            ::operator delete(memory,
+                              std::align_val_t{local_slot_alignment});
+        }};
+    auto bitmap = std::make_shared<lager::arena_slot_bitmap>(
+        local_slot_count);
+    lager::storage_extent local_extent;
+    local_extent.id = local_extent_id;
+    local_extent.base = local_base;
+    local_extent.size_bytes = byte_count;
+    local_extent.slot_size = local_slot_size;
+    local_extent.slot_alignment = local_slot_alignment;
+    local_extent.layout_id = local_layout_id;
+    local_extent.owner = local_owner;
+    local_extent.slot_bitmap = bitmap;
+    local_extent.allocate_slot = [local_base, bitmap](std::size_t size,
+                                                       std::size_t alignment) {
+        if (size > local_slot_size || alignment > local_slot_alignment) {
+            return static_cast<void*>(nullptr);
+        }
+        const auto slot = bitmap->allocate();
+        return slot ? static_cast<void*>(local_base +
+                                         *slot * local_slot_size)
+                    : nullptr;
+    };
+    local_extent.refresh_allocation_state = [] {};
+    local_extent.can_reclaim_slots = true;
+
+    lager::shared_store_runtime runtime;
+    runtime.publish_extent(std::move(local_extent));
+    auto metadata_store = runtime.create<int, lager::shared_ephemeral_policy>(
+        {0x434f4e54524f4c31ULL}, 0);
+    const auto metadata_snapshot = runtime.read(metadata_store);
+    auto extents = metadata_snapshot.extents();
+    auto active_storage = runtime.activate_storage();
+
+    auto make_root = [&](std::size_t count, int start) {
+        auto storage_scope = runtime.activate_storage();
+        auto builder = values_type{}.transient();
+        for (std::size_t i = 0; i < count; ++i)
+            builder.push_back(start + static_cast<int>(i));
+        return immer::make_storage<root_state>(root_state{
+            std::move(builder).persistent()});
+    };
+
+    auto initial = make_root(4096, 0);
+    auto protocol = std::make_shared<controlled_gc_protocol>(extents, initial);
+    const auto transaction = protocol->begin_transaction();
+    immer::storage_ptr<root_state> candidate;
+    {
+        auto storage_scope = runtime.activate_storage();
+        auto changed = initial->values.set(0, -1);
+        candidate = immer::make_storage<root_state>(
+            root_state{std::move(changed)});
+    }
+    protocol->set_candidate(transaction, candidate);
+    const auto orphan = make_root(4096, 20000);
+
+    traced_nodes old_nodes;
+    initial->values.trace_children(old_nodes);
+    traced_nodes candidate_nodes;
+    candidate->values.trace_children(candidate_nodes);
+    std::vector<std::uint64_t> grafted_nodes;
+    std::set_intersection(old_nodes.bits.begin(),
+                          old_nodes.bits.end(),
+                          candidate_nodes.bits.begin(),
+                          candidate_nodes.bits.end(),
+                          std::back_inserter(grafted_nodes));
+    require(!grafted_nodes.empty(),
+            "controlled candidate did not graft old vector nodes");
+
+    std::vector<bool> allocated_before(local_slot_count);
+    for (std::size_t slot = 0; slot < local_slot_count; ++slot)
+        allocated_before[slot] = bitmap->is_allocated(slot);
+
+    deterministic_gate root_capture_gate;
+    std::size_t first_reclaimed = 0;
+    std::exception_ptr collector_error;
+    std::thread first_collector([&] {
+        try {
+            first_reclaimed = protocol->collect(
+                [&] { root_capture_gate.pause(); });
+        } catch (...) {
+            collector_error = std::current_exception();
+        }
+    });
+    root_capture_gate.wait_until_arrived();
+
+    deterministic_gate reader_attempt_gate;
+    std::optional<controlled_gc_protocol::snapshot> old_reader;
+    std::exception_ptr reader_error;
+    std::thread acquiring_reader([&] {
+        try {
+            old_reader.emplace(protocol->read(
+                [&] { reader_attempt_gate.signal(); }));
+        } catch (...) {
+            reader_error = std::current_exception();
+        }
+    });
+    reader_attempt_gate.wait_until_arrived();
+    root_capture_gate.release();
+    first_collector.join();
+    acquiring_reader.join();
+    if (collector_error)
+        std::rethrow_exception(collector_error);
+    if (reader_error)
+        std::rethrow_exception(reader_error);
+    require(old_reader.has_value(),
+            "reader did not acquire a snapshot after root capture");
+    require(old_reader->root() == initial,
+            "reader did not acquire the root protected by the collection");
+    require(first_reclaimed > 0,
+            "controlled collection did not reclaim unreachable slots");
+    require(!extents.is_allocated(orphan.template rebind<void>()),
+            "controlled collection retained an unreachable root slot");
+
+    deterministic_gate publication_capture_gate;
+    std::size_t second_reclaimed = 0;
+    collector_error = nullptr;
+    std::thread second_collector([&] {
+        try {
+            second_reclaimed = protocol->collect(
+                [&] { publication_capture_gate.pause(); });
+        } catch (...) {
+            collector_error = std::current_exception();
+        }
+    });
+    publication_capture_gate.wait_until_arrived();
+    deterministic_gate writer_attempt_gate;
+    std::exception_ptr writer_error;
+    std::thread late_writer([&] {
+        try {
+            writer_attempt_gate.signal();
+            protocol->publish(transaction);
+        } catch (...) {
+            writer_error = std::current_exception();
+        }
+    });
+    writer_attempt_gate.wait_until_arrived();
+    publication_capture_gate.release();
+    second_collector.join();
+    late_writer.join();
+    if (collector_error)
+        std::rethrow_exception(collector_error);
+    if (writer_error)
+        std::rethrow_exception(writer_error);
+    (void) second_reclaimed;
+    require(protocol->current() == candidate,
+            "writer failed to publish its pre-capture candidate");
+    require(extents.is_allocated(candidate.template rebind<void>()),
+            "GC reclaimed a candidate published after root capture");
+    require(old_reader->root()->values[0] == 0,
+            "old reader lost its root while collection and commit raced");
+    require(protocol->pin_count() == 1,
+            "reader pin disappeared before snapshot release");
+
+    const auto old_token = old_reader->token();
+    old_reader.reset();
+    auto current_reader = protocol->read();
+    require(current_reader.token().slot == old_token.slot &&
+                current_reader.token().sequence != old_token.sequence,
+            "released reader pin slot was not immediately reusable");
+    protocol->release_pin(old_token);
+    require(protocol->pin_count() == 1 &&
+                current_reader.root() == candidate,
+            "stale release cleared a newly reused reader pin");
+
+    auto replacement = make_root(4096, 40000);
+    const auto replacement_transaction = protocol->begin_transaction();
+    protocol->set_candidate(replacement_transaction, replacement);
+    protocol->publish(replacement_transaction);
+    (void) protocol->collect();
+    require(extents.is_allocated(candidate.template rebind<void>()),
+            "GC reclaimed a subtree still pinned by a reader");
+    require(current_reader.root()->values[0] == -1,
+            "GC reclaimed a grafted node reachable from the pinned root");
+
+    current_reader.reset();
+    (void) protocol->collect();
+    std::vector<std::size_t> freed_slots;
+    for (std::size_t slot = 0; slot < local_slot_count; ++slot)
+        if (allocated_before[slot] && !bitmap->is_allocated(slot))
+            freed_slots.push_back(slot);
+    require(!freed_slots.empty(),
+            "controlled sweep did not expose unreachable slots for reuse");
+    auto recycled = make_root(1, 50000);
+    require(std::find(freed_slots.begin(),
+                      freed_slots.end(),
+                      recycled.slot_id()) != freed_slots.end(),
+            "controlled arena did not reuse a swept slot");
+    require(replacement->values[0] == 40000,
+            "live replacement root was damaged by slot reuse");
+    std::cout << "controlled arena preserved reader, candidate, and grafted "
+                 "nodes; reclaimed " << freed_slots.size()
+              << " unreachable slots and reused one\n";
+}
 #endif
 
 } // namespace
@@ -1353,6 +1835,10 @@ int main(int argc, char** argv)
 #else
             throw std::runtime_error{"shared ephemeral test requires POSIX"};
 #endif
+        }
+        if (mode == "controlled-gc" && argc == 2) {
+            controlled_arena_reclamation();
+            return 0;
         }
         if (argc != 3 && argc != 4)
             throw std::invalid_argument{

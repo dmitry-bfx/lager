@@ -73,6 +73,19 @@ reader is still pinned and confirms both the reader and the new root retain the
 old value. Slot reclamation remains disabled, so this verifies root capture
 and graph reachability, not reuse safety.
 
+`persistent-round-trip-controlled-gc` uses an in-memory, single-process arena
+with reclamation enabled. Barriers force a reader to attempt acquisition during
+root capture and a writer to publish a pre-capture candidate afterward. The
+test keeps an old reader through a graft and a collection, releases and reuses
+its pin slot, verifies that a stale release cannot clear the new pin, then
+proves that unreachable slots are reclaimed and one is allocated again. This
+validates the first controlled arena only; it does not validate the mapped
+multiprocess protocol.
+
+The staged synchronization design and the multiprocess protocol still required
+before mapped reclamation are described in
+[`doc/shared-state-gc-protocol.md`](../../doc/shared-state-gc-protocol.md).
+
 The durable root journal, mapped node bytes, shared-ephemeral root table, and
 reader/candidate pin descriptors are process-shared. Runtime domain
 descriptors, extent-directory snapshots, and slot bitmaps are process-local.
