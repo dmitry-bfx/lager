@@ -19,10 +19,12 @@
 #include <boost/preprocessor/punctuation/remove_parens.hpp>
 #include <boost/preprocessor/seq/for_each_i.hpp>
 #include <boost/preprocessor/stringize.hpp>
+#include <lager/extra/derive/member.hpp>
 
 #define LAGER_DERIVE_IMPL_CEREAL_ITER__(r__, data__, i__, elem__)              \
     BOOST_PP_COMMA_IF(i__)                                                     \
-    cereal::make_nvp(BOOST_PP_STRINGIZE(elem__), x.elem__)
+    cereal::make_nvp(BOOST_PP_STRINGIZE(LAGER_DERIVE_MEMBER_NAME__(elem__)),  \
+                     x.LAGER_DERIVE_MEMBER_NAME__(elem__))
 
 #define LAGER_DERIVE_IMPL_CEREAL_MEMBERS_NON_EMPTY__(r__, members__)           \
     ar(BOOST_PP_SEQ_FOR_EACH_I_R(                                              \

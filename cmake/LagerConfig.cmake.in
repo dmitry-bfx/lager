@@ -1,0 +1,6 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Immer REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/LagerTargets.cmake")
+check_required_components(Lager)

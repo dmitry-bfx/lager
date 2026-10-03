@@ -14,6 +14,7 @@
 
 #include <boost/preprocessor/punctuation/remove_parens.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
+#include <lager/extra/derive/member.hpp>
 
 #include <boost/functional/hash.hpp>
 
@@ -22,8 +23,9 @@
 // use formula from boost::hash_combine as in:
 // https://www.boost.org/doc/libs/1_55_0/doc/html/hash/reference.html#boost.hash_combine
 #define LAGER_DERIVE_IMPL_HASH_ITER__(r__, data__, elem__)                     \
-    seed ^= std::hash<decltype(x.elem__)>{}(x.elem__) + 0x9e3779b9 +           \
-            (seed << 6) + (seed >> 2);
+    seed ^= std::hash<decltype(x.LAGER_DERIVE_MEMBER_NAME__(elem__))>{}(       \
+                x.LAGER_DERIVE_MEMBER_NAME__(elem__)) +                        \
+            0x9e3779b9 + (seed << 6) + (seed >> 2);
 
 #define LAGER_DERIVE_IMPL_HASH(r__, ns__, name__, members__)                   \
     namespace std {                                                            \

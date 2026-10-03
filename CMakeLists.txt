@@ -21,7 +21,14 @@ endif()
 
 include(GNUInstallDirs)
 
+# Shared storage headers expose Immer's relocatable node handles.
+if(NOT TARGET immer)
+  find_package(Immer REQUIRED)
+endif()
+
 option(lager_BUILD_TESTS "Build tests" "${PROJECT_IS_TOP_LEVEL}")
+option(lager_BUILD_PERSISTENT_ROUND_TRIP
+  "Build the multiprocess persistent storage round-trip test" OFF)
 option(lager_BUILD_FAILURE_TESTS "Build failure tests" "${PROJECT_IS_TOP_LEVEL}")
 option(lager_BUILD_EXAMPLES "Build examples" "${PROJECT_IS_TOP_LEVEL}")
 option(lager_BUILD_DEBUGGER_EXAMPLES "Build examples that showcase the web based debugger" "${PROJECT_IS_TOP_LEVEL}")
@@ -64,6 +71,7 @@ endif()
 # the library
 add_library(lager INTERFACE)
 add_library(lager::lager ALIAS lager)
+target_link_libraries(lager INTERFACE immer)
 target_include_directories(lager INTERFACE
   $<BUILD_INTERFACE:${lager_BINARY_DIR}/>
   $<BUILD_INTERFACE:${lager_SOURCE_DIR}/>
@@ -104,6 +112,7 @@ target_sources(lager PUBLIC FILE_SET HEADERS
     lager/detail/smart_lens.hpp
     lager/detail/xform_nodes.hpp
     lager/effect.hpp
+    lager/garbage_collector.hpp
     lager/event_loop/boost_asio.hpp
     lager/event_loop/manual.hpp
     lager/event_loop/qml.hpp
@@ -130,8 +139,12 @@ target_sources(lager PUBLIC FILE_SET HEADERS
     lager/extra/derive/eq.hpp
     lager/extra/derive/hana.hpp
     lager/extra/derive/hash.hpp
+    lager/extra/derive/member.hpp
     lager/extra/derive/size_check.hpp
+    lager/extra/derive/typecheck.hpp
     lager/extra/enum.hpp
+    lager/extra/persistent.hpp
+    lager/extra/persistent_state.hpp
     lager/extra/qt.hpp
     lager/extra/struct.hpp
     lager/extra/thunk.hpp
@@ -145,10 +158,15 @@ target_sources(lager PUBLIC FILE_SET HEADERS
     lager/lenses/tuple.hpp
     lager/lenses/unbox.hpp
     lager/lenses/variant.hpp
+    lager/mapped_storage.hpp
     lager/reader.hpp
     lager/resources_path.hpp.in
     lager/sensor.hpp
+    lager/root_journal.hpp
+    lager/shared_state.hpp
+    lager/shared_memory.hpp
     lager/setter.hpp
+    lager/storage.hpp
     lager/state.hpp
     lager/store.hpp
     lager/tags.hpp
@@ -164,8 +182,62 @@ install(TARGETS lager EXPORT LagerConfig FILE_SET HEADERS)
 if (lager_BUILD_TESTS OR lager_BUILD_EXAMPLES)
   find_package(Boost 1.56 CONFIG)
   find_package(Threads REQUIRED)
-  find_package(Immer REQUIRED)
   find_package(Zug REQUIRED)
+endif()
+
+# Kept separate from the unit-test suite so the persistent storage recovery
+# test can be built and run without compiling every Lager test target.
+if (lager_BUILD_PERSISTENT_ROUND_TRIP)
+  find_package(Boost 1.56 CONFIG REQUIRED)
+  find_package(Zug CONFIG REQUIRED)
+  enable_testing()
+  add_executable(lager-persistent-round-trip
+    test/integration/persistent_round_trip.cpp)
+  target_compile_definitions(lager-persistent-round-trip PRIVATE
+    LAGER_PERSISTENT_ROUND_TRIP_FAILPOINTS)
+  target_link_libraries(lager-persistent-round-trip PRIVATE lager zug)
+  target_include_directories(lager-persistent-round-trip PRIVATE
+    ${Boost_INCLUDE_DIRS}
+    ${Boost_INCLUDE_DIR})
+  set(_persistent_round_trip_store
+    "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip.store")
+  add_test(NAME persistent-round-trip-write
+    COMMAND lager-persistent-round-trip write ${_persistent_round_trip_store})
+  set_tests_properties(persistent-round-trip-write PROPERTIES
+    FIXTURES_SETUP persistent-round-trip-store)
+  add_test(NAME persistent-round-trip-read-before-update
+    COMMAND lager-persistent-round-trip read ${_persistent_round_trip_store} initial)
+  set_tests_properties(persistent-round-trip-read-before-update PROPERTIES
+    FIXTURES_REQUIRED persistent-round-trip-store)
+  add_test(NAME persistent-round-trip-update
+    COMMAND lager-persistent-round-trip update ${_persistent_round_trip_store})
+  set_tests_properties(persistent-round-trip-update PROPERTIES
+    FIXTURES_REQUIRED persistent-round-trip-store
+    DEPENDS persistent-round-trip-read-before-update)
+  add_test(NAME persistent-round-trip-read-after-update
+    COMMAND lager-persistent-round-trip read ${_persistent_round_trip_store} updated)
+  set_tests_properties(persistent-round-trip-read-after-update PROPERTIES
+    FIXTURES_REQUIRED persistent-round-trip-store
+    DEPENDS persistent-round-trip-update)
+  if (UNIX)
+    add_test(NAME persistent-round-trip-shared-ephemeral
+      COMMAND lager-persistent-round-trip ephemeral)
+    add_test(NAME persistent-round-trip-transactions
+      COMMAND lager-persistent-round-trip transactions
+        "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-transactions.store")
+    add_test(NAME persistent-round-trip-competing-writers
+      COMMAND lager-persistent-round-trip race
+        "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-competing-writers.store")
+    add_test(NAME persistent-round-trip-cross-process-dependency
+      COMMAND lager-persistent-round-trip cross-dependency
+        "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-cross-dependency.store")
+    foreach(_stage allocation data-flush root-record-write publication)
+      add_test(NAME persistent-round-trip-crash-${_stage}
+        COMMAND lager-persistent-round-trip crash
+          "${CMAKE_CURRENT_BINARY_DIR}/persistent-round-trip-crash-${_stage}.store"
+          ${_stage})
+    endforeach()
+  endif()
 endif()
 
 # the library, local development target
@@ -258,5 +330,21 @@ if (lager_EMBED_RESOURCES_PATH)
   install(FILES ${CMAKE_BINARY_DIR}/include/lager/resources_path.hpp DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/lager")
 endif()
 
-install(EXPORT LagerConfig DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Lager")
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+  cmake/LagerConfig.cmake.in
+  "${CMAKE_CURRENT_BINARY_DIR}/LagerConfig.cmake"
+  INSTALL_DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Lager")
+write_basic_package_version_file(
+  "${CMAKE_CURRENT_BINARY_DIR}/LagerConfigVersion.cmake"
+  VERSION ${PROJECT_VERSION}
+  COMPATIBILITY SameMajorVersion)
+install(EXPORT LagerConfig
+  FILE LagerTargets.cmake
+  NAMESPACE lager::
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Lager")
+install(FILES
+  "${CMAKE_CURRENT_BINARY_DIR}/LagerConfig.cmake"
+  "${CMAKE_CURRENT_BINARY_DIR}/LagerConfigVersion.cmake"
+  DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/Lager")
 install(DIRECTORY lager DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}" PATTERN "*.hpp")

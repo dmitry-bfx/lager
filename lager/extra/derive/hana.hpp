@@ -16,6 +16,7 @@
 #include <boost/preprocessor/punctuation/remove_parens.hpp>
 #include <boost/preprocessor/seq/for_each_i.hpp>
 #include <boost/preprocessor/stringize.hpp>
+#include <lager/extra/derive/member.hpp>
 
 #include <boost/hana/accessors.hpp>
 #include <boost/hana/pair.hpp>
@@ -29,6 +30,8 @@ namespace lager::struct_detail {
 template <typename Memptr, Memptr ptr>
 struct member_ptr
 {
+    using member_pointer_type = Memptr;
+
     template <typename T>
     constexpr decltype(auto) operator()(T&& t) const
     {
@@ -61,14 +64,15 @@ constexpr auto prepare_member_name()
 
 #define LAGER_DERIVE_IMPL_HANA_ACCESSOR_NAMES_ITER__(r__, data__, i__, elem__) \
     BOOST_PP_COMMA_IF(i__)                                                     \
-    BOOST_PP_STRINGIZE(elem__)
+    BOOST_PP_STRINGIZE(LAGER_DERIVE_MEMBER_NAME__(elem__))
 
 #define LAGER_DERIVE_IMPL_HANA_ACCESSOR_PAIRS_ITER__(r__, data__, i__, elem__) \
     BOOST_PP_COMMA_IF(i__)                                                     \
     ::boost::hana::make_pair(                                                  \
         ::lager::struct_detail::prepare_member_name<i__, member_names>(),      \
-        ::lager::struct_detail::member_ptr<decltype(&type_t::elem__),          \
-                                           &type_t::elem__>{})
+        ::lager::struct_detail::member_ptr<                                    \
+            decltype(&type_t::LAGER_DERIVE_MEMBER_NAME__(elem__)),             \
+            &type_t::LAGER_DERIVE_MEMBER_NAME__(elem__)>{})
 
 #define LAGER_DERIVE_IMPL_HANA_ACCESSORS__(r__, t__, members__)                \
     using type_t = BOOST_PP_REMOVE_PARENS(t__);                                \

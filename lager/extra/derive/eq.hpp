@@ -14,8 +14,11 @@
 
 #include <boost/preprocessor/punctuation/remove_parens.hpp>
 #include <boost/preprocessor/seq/for_each.hpp>
+#include <lager/extra/derive/member.hpp>
 
-#define LAGER_DERIVE_IMPL_EQ_ITER__(r__, data__, elem__) &&a.elem__ == b.elem__
+#define LAGER_DERIVE_IMPL_EQ_ITER__(r__, data__, elem__)                      \
+    &&a.LAGER_DERIVE_MEMBER_NAME__(elem__) ==                                  \
+        b.LAGER_DERIVE_MEMBER_NAME__(elem__)
 
 #define LAGER_DERIVE_IMPL_EQ(r__, ns__, name__, members__)                     \
     namespace ns__ {                                                           \
